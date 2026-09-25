@@ -1,0 +1,8 @@
+# Link the MSVC runtime statically so the shipped .exe needs nothing installed.
+# Without this the binary imports VCRUNTIME140.dll from the VC++ Redistributable,
+# which most machines have but none are guaranteed to. Costs ~0.1 MB.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,0 +1,210 @@
+name: Build and release
+
+# The release number is the `version` in Cargo.toml. Bump it there and nowhere
+# else: `config::VERSION` reads it via CARGO_PKG_VERSION, so the binary, the UI
+# and the tag always agree.
+#
+# A run that finds the tag already released builds and tests as usual but stops
+# short of publishing, so pushing unrelated commits never fails the workflow.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a release when the version is new"
+        type: boolean
+        default: true
+
+# Only the release job writes; everything else is read-only.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      tag: ${{ steps.read.outputs.tag }}
+      already_released: ${{ steps.check.outputs.already_released }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from Cargo.toml
+        id: read
+        run: |
+          set -euo pipefail
+          # cargo metadata rather than grep, so a version string inside a
+          # dependency entry or a comment cannot be picked up by mistake.
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "::error::could not read the package version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml version: $version (tag v$version)"
+
+      - name: Check whether that release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.read.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "already_released=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG is already released; this run will build but not publish."
+          else
+            echo "already_released=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG has not been released yet."
+          fi
+
+  build:
+    name: ${{ matrix.name }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux (x86_64)
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: genlauncher
+            asset: GenLauncher-${{ needs.version.outputs.version }}-linux-x86_64.tar.gz
+          - name: Windows (x86_64)
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: genlauncher.exe
+            asset: GenLauncher-${{ needs.version.outputs.version }}-windows-x86_64.zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # winit/glow need X11 and Wayland headers; rfd uses the xdg-desktop-portal
+      # backend by default, so no GTK development packages are required.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config \
+            libgl1-mesa-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev
+
+      - name: Clippy
+        run: cargo clippy --target ${{ matrix.target }} --all-targets -- -D warnings
+
+      # The two `#[ignore]`d tests reach out to the mod storage and are left out.
+      - name: Test
+        run: cargo test --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          staging="GenLauncher"
+          mkdir -p "$staging"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$staging/GenLauncher"
+          cp README.md "$staging/"
+          chmod +x "$staging/GenLauncher"
+          tar -czf "${{ matrix.asset }}" "$staging"
+          sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $staging = 'GenLauncher'
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$staging/GenLauncher.exe"
+          Copy-Item README.md $staging
+          Compress-Archive -Path $staging -DestinationPath "${{ matrix.asset }}"
+          (Get-FileHash "${{ matrix.asset }}" -Algorithm SHA256).Hash.ToLower() + "  ${{ matrix.asset }}" |
+            Out-File -Encoding ascii "${{ matrix.asset }}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    needs: [version, build]
+    # Never publish from a pull request, from a run whose version is already
+    # out, or when a manual run opted out.
+    if: >-
+      github.event_name != 'pull_request' &&
+      needs.version.outputs.already_released == 'false' &&
+      (github.event_name != 'workflow_dispatch' || inputs.publish)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List what will be uploaded
+        run: ls -la artifacts
+
+      # Re-checked here because `version` ran before the builds: a release
+      # published in the meantime must not be overwritten.
+      - name: Re-check that the release is still absent
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::$TAG was released while this run was building; refusing to overwrite it."
+            exit 1
+          fi
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # `gh release create` creates the tag at this commit if it is missing.
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "GenLauncher $VERSION" \
+            --generate-notes \
+            artifacts/*
+          echo "::notice::published $TAG"
