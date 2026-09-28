@@ -294,7 +294,7 @@ mod tests {
             "RGBA buffer does not match the stated size"
         );
         assert!(icon.width >= 128, "expected the 256px icon, got {}px", icon.width);
-        assert!(icon.rgba.chunks_exact(4).any(|px| px[3] > 0), "icon is fully transparent");
+        assert!(icon.rgba.as_chunks::<4>().0.iter().any(|px| px[3] > 0), "icon is fully transparent");
     }
 
     #[test]

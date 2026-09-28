@@ -63,7 +63,7 @@ fn to_color_image(image: &image::DynamicImage, grayscale: bool) -> ColorImage {
 
     if grayscale {
         // The same flat average the C# generator used.
-        for px in pixels.chunks_exact_mut(4) {
+        for px in pixels.as_chunks_mut::<4>().0 {
             let avg = ((px[0] as u32 + px[1] as u32 + px[2] as u32) / 3) as u8;
             px[0] = avg;
             px[1] = avg;

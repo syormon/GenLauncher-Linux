@@ -59,7 +59,7 @@ for `game.dat`, and restoring the folder. It claims the process-wide game
 folder, so run it on its own (CI does):
 
 ```bash
-cargo test wine_launch_end_to_end -- --ignored
+cargo test proton_launch_end_to_end -- --ignored
 ```
 
 ## General Network usage:
