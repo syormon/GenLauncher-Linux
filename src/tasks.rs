@@ -10,7 +10,7 @@ use std::sync::mpsc::Sender;
 use crate::config::{self, Game, SessionInfo};
 use crate::game::{self, launcher, stock_files};
 use crate::model::repos::VulkanData;
-use crate::model::{ModVersion, ModificationType, ReposVersion};
+use crate::model::{ModVersion, ModificationType, ReposVersion, ProtonSettings};
 use crate::net::download::{Cancel, DownloadEvent, DownloadResult, ModKey};
 use crate::net::{self, download, manifests};
 use crate::state::{self, Store};
@@ -527,87 +527,146 @@ pub struct LaunchRequest {
     pub game_params: String,
     pub use_vulkan: bool,
     pub gentool_auto_update: bool,
+    /// The repository's modded game executable, to download if needed and run
+    /// in place of the stock one ("Use modded exe files").
+    pub modded_exe: Option<ModVersion>,
     /// Set when the repository advertises a Vulkan layer, so the launch can
     /// refresh it before starting the game.
     pub vulkan: Option<VulkanData>,
+    /// How Proton runs the game off Windows.
+    pub proton: ProtonSettings,
 }
 
 /// Verify, link, run, unlink. Runs on its own thread; the game call blocks.
+///
+/// A panic on this thread must still report back: the UI treats the game as
+/// running, and refuses to close, until it hears `GameFinished`.
 pub fn spawn_launch(request: LaunchRequest, tx: Sender<Bg>) {
     std::thread::spawn(move || {
-        let LaunchRequest {
-            world_builder,
-            versions,
-            session,
-            camera_height,
-            has_selected_mod,
-            check_files,
-            windowed,
-            quick_start,
-            game_params,
-            use_vulkan,
-            gentool_auto_update,
-            vulkan,
-        } = request;
-
-        // The integrity check needs the mod linked in, then unlinked again.
-        if check_files && session.connected {
-            if let Some(mod_version) =
-                versions.iter().find(|v| v.kind() == ModificationType::Mod).cloned()
-            {
-                let ok = verify_mod_files(&mod_version, &session, has_selected_mod);
-                launcher::restore_game_folder();
-                if !ok {
-                    let _ = tx.send(Bg::GamePrepared { world_builder, ok: false });
-                    return;
-                }
-            }
-        }
-
-        launcher::prepare_game_files(
-            &versions,
-            &session,
-            camera_height,
-            has_selected_mod,
-            true,
-            false,
-        );
-
-        let _ = tx.send(Bg::GamePrepared { world_builder, ok: true });
-
-        // The Vulkan layer is refreshed and linked in after the mod files are
-        // in place, exactly where `CheckAndUpdateVulkan` sat in the C# build.
-        if use_vulkan && !world_builder {
-            update_vulkan_layer(session.connected, vulkan.as_ref(), &tx);
-            game::vulkan::create_symlinks(gentool_auto_update);
-        }
-
-        let result = if world_builder {
-            launcher::run_world_builder(&versions).map(|()| false)
-        } else {
-            launcher::run_game(&versions, windowed, quick_start, &game_params)
-                .map(|o| o.played_long_enough)
-        };
-
-        launcher::restore_game_folder();
-
-        match result {
-            Ok(played_long_enough) => {
-                let _ = tx.send(Bg::GameFinished {
-                    world_builder,
-                    played_long_enough,
-                    error: None,
-                });
-            }
-            Err(e) => {
-                let _ = tx.send(Bg::GameFinished {
-                    world_builder,
-                    played_long_enough: false,
-                    error: Some(format!("{e:#}")),
-                });
-            }
+        let world_builder = request.world_builder;
+        let panic_tx = tx.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || run_launch(request, tx)));
+        if let Err(panic) = outcome {
+            let reason = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            log::error!("the launch thread panicked: {reason}");
+            launcher::restore_game_folder();
+            let _ = panic_tx.send(Bg::GameFinished {
+                world_builder,
+                played_long_enough: false,
+                error: Some(format!("The launch failed unexpectedly: {reason}")),
+            });
         }
     });
+}
+
+fn run_launch(request: LaunchRequest, tx: Sender<Bg>) {
+    let LaunchRequest {
+        world_builder,
+        versions,
+        session,
+        camera_height,
+        has_selected_mod,
+        check_files,
+        windowed,
+        quick_start,
+        game_params,
+        use_vulkan,
+        gentool_auto_update,
+        modded_exe,
+        vulkan,
+        proton,
+    } = request;
+
+    // A prefix Proton has not created yet has no `Options.ini`, and the
+    // game crashes on start without one; this writes the stock file.
+    // Only with a prefix to put it in: otherwise it would land in ~/Documents.
+    if cfg!(not(windows)) && game::proton::prefix(&proton).is_some() {
+        if let Err(e) = game::options::GameOptions::load(session.game_mode, &proton) {
+            log::warn!("could not prepare Options.ini: {e:#}");
+        }
+    }
+
+    let mut versions = versions;
+    if let Some(exe) = modded_exe {
+        match ensure_executable(&exe, session.connected, &tx) {
+            Ok(()) => versions.push(exe),
+            Err(e) => log::warn!("running the stock executable: {e:#}"),
+        }
+    }
+
+    // The integrity check needs the mod linked in, then unlinked again.
+    if check_files && session.connected {
+        if let Some(mod_version) =
+            versions.iter().find(|v| v.kind() == ModificationType::Mod).cloned()
+        {
+            let ok = verify_mod_files(&mod_version, &session, has_selected_mod);
+            launcher::restore_game_folder();
+            if !ok {
+                let _ = tx.send(Bg::GamePrepared { world_builder, ok: false });
+                return;
+            }
+        }
+    }
+
+    launcher::prepare_game_files(
+        &versions,
+        &session,
+        camera_height,
+        has_selected_mod,
+        true,
+        false,
+    );
+
+    let _ = tx.send(Bg::GamePrepared { world_builder, ok: true });
+
+    if !world_builder {
+        if gentool_auto_update {
+            if session.connected {
+                update_gentool(&tx);
+            }
+        } else {
+            // Restoring the folder after the last run put it back.
+            game::gentool::shadow_dll();
+        }
+    }
+
+    // The Vulkan layer is refreshed and linked in after the mod files are
+    // in place, exactly where `CheckAndUpdateVulkan` sat in the C# build.
+    if use_vulkan && !world_builder {
+        update_vulkan_layer(session.connected, vulkan.as_ref(), &tx);
+        game::vulkan::create_symlinks(gentool_auto_update);
+    }
+
+    let result = if world_builder {
+        launcher::run_world_builder(&versions, &proton).map(|()| false)
+    } else {
+        launcher::run_game(&versions, windowed, quick_start, &game_params, &proton)
+            .map(|o| o.played_long_enough)
+    };
+
+    launcher::restore_game_folder();
+
+    match result {
+        Ok(played_long_enough) => {
+            let _ = tx.send(Bg::GameFinished {
+                world_builder,
+                played_long_enough,
+                error: None,
+            });
+        }
+        Err(e) => {
+            let _ = tx.send(Bg::GameFinished {
+                world_builder,
+                played_long_enough: false,
+                error: Some(format!("{e:#}")),
+            });
+        }
+    }
+
 }
 
 /// Fetch a newer Vulkan layer if the repository has one. Runs on the launch
@@ -644,6 +703,73 @@ fn update_vulkan_layer(connected: bool, vulkan: Option<&VulkanData>, tx: &Sender
 
     let error = result.err().map(|e| format!("{e:#}"));
     let _ = tx.send(Bg::SideDone { error });
+}
+
+/// Download an executable from the repository unless it is already on disk.
+fn ensure_executable(exe: &ModVersion, connected: bool, tx: &Sender<Bg>) -> anyhow::Result<()> {
+    let folder = exe.folder_path();
+    let file = gfs::resolve_case_insensitive(&folder, exe.info.executable_file_name.as_ref());
+    if file.is_file() {
+        return Ok(());
+    }
+    anyhow::ensure!(connected, "{} is not downloaded and the launcher is offline", exe.name());
+    anyhow::ensure!(!exe.info.simple_download_link.is_empty(), "{} has no download link", exe.name());
+
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let progress_tx = tx.clone();
+    let label = exe.name().to_owned();
+    let result = runtime.block_on(download::simple_file(
+        &exe.info.simple_download_link,
+        &folder,
+        true,
+        move |total, read| {
+            let _ = progress_tx.send(Bg::SideProgress { label: label.clone(), total, read });
+        },
+    ));
+    let _ = tx.send(Bg::SideDone { error: result.as_ref().err().map(|e| format!("{e:#}")) });
+    result?;
+
+    anyhow::ensure!(file.is_file(), "the {} download has no {}", exe.name(), file.display());
+    Ok(())
+}
+
+/// Install GenTool's `d3d8.dll`, or replace it when gentool.net has a newer
+/// one. An unreachable site just leaves the current copy in place.
+fn update_gentool(tx: &Sender<Bg>) {
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        return;
+    };
+    let latest = match runtime.block_on(net::gentool::latest_version()) {
+        Ok(latest) => latest,
+        Err(e) => {
+            log::warn!("cannot check for GenTool updates: {e:#}");
+            return;
+        }
+    };
+    if !game::gentool::is_outdated(game::gentool::current_version(), &latest) {
+        return;
+    }
+
+    let staging = config::game_path(config::LAUNCHER_FOLDER).join("GenTool");
+    let _ = std::fs::remove_dir_all(&staging);
+
+    let progress_tx = tx.clone();
+    let result = runtime
+        .block_on(download::simple_file(
+            &game::gentool::download_link(&latest),
+            &staging,
+            true,
+            move |total, read| {
+                let _ = progress_tx.send(Bg::SideProgress { label: "GenTool".to_owned(), total, read });
+            },
+        ))
+        .and_then(|_| game::gentool::install_dll_from(&staging));
+    let _ = std::fs::remove_dir_all(&staging);
+
+    if let Err(e) = &result {
+        log::warn!("could not install GenTool {latest}: {e:#}");
+    }
+    let _ = tx.send(Bg::SideDone { error: result.err().map(|e| format!("GenTool: {e:#}")) });
 }
 
 /// Link just the mod, compare its files against the repository, and report.

@@ -14,6 +14,8 @@ pub const LAUNCHER_IMAGE_SUBFOLDER: &str = "LauncherImages";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const STEAM_FOLDER_NAME: &str = "ZH_Generals";
 pub const ORIGINAL_GAME_ALIAS: &str = "Original Game";
+/// The repository executable "Use modded exe files" refers to.
+pub const MODDED_EXE_NAME: &str = "ModdedExe";
 
 pub const ZH_REPOS: &str =
     "https://raw.githubusercontent.com/p0ls3r/GenLauncherModsData/master/ReposModificationDataZH4.yaml";
@@ -85,13 +87,32 @@ pub fn set_game_dir(path: PathBuf) {
 }
 
 /// Resolve a launcher-relative path against the game folder.
+///
+/// Off Windows the folder sits on a case-sensitive filesystem while the game,
+/// under Wine, still looks names up case-insensitively. Matching existing
+/// entries keeps us from creating `data/` beside the game's `Data/`.
 pub fn game_path(rel: impl AsRef<Path>) -> PathBuf {
-    game_dir().join(rel)
+    if cfg!(windows) {
+        game_dir().join(rel)
+    } else {
+        crate::util::fs::resolve_case_insensitive(game_dir(), rel.as_ref())
+    }
 }
 
 /// Directory holding the user's Options.ini, Replays and Maps for `game`.
-pub fn user_data_dir(game: Game) -> PathBuf {
-    let docs = dirs::document_dir()
+///
+/// Under Proton the game writes into the prefix's Documents folder
+/// (`…/compatdata/<appid>/pfx/drive_c/users/steamuser/Documents`), not the
+/// Linux user's own `~/Documents`.
+pub fn user_data_dir(game: Game, proton: &crate::model::ProtonSettings) -> PathBuf {
+    let prefix_docs = if cfg!(windows) {
+        None
+    } else {
+        crate::game::proton::prefix(proton).map(|prefix| crate::game::proton::game_documents_dir(&prefix))
+    };
+
+    let docs = prefix_docs
+        .or_else(dirs::document_dir)
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."));
     docs.join(game.user_data_dir_name())
@@ -104,7 +125,7 @@ mod tests {
     #[test]
     fn the_reported_version_comes_from_cargo_toml() {
         // The release workflow tags from the Cargo.toml version, so the value
-        // the launcher shows and self-update compares against must be the same.
+        // the launcher shows must be the same.
         assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
         assert!(!VERSION.is_empty());
         assert!(

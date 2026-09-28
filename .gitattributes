@@ -1,0 +1,7 @@
+# Keep text files LF on every platform, so an editor or checkout on Windows
+# cannot turn the whole tree into a CRLF diff.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary

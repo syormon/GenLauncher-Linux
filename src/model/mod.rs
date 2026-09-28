@@ -359,6 +359,36 @@ impl GameModification {
     }
 }
 
+/// How the game runs through Proton on Linux (see `game::proton`). Empty
+/// fields mean "do what Steam does".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ProtonSettings {
+    /// A Proton folder, or its `proton` script, to use instead of the one
+    /// Steam runs the game with.
+    #[serde(deserialize_with = "null_to_empty")]
+    pub proton: String,
+    /// Extra environment, as whitespace-separated `KEY=VALUE` pairs.
+    #[serde(deserialize_with = "null_to_empty")]
+    pub env: String,
+    /// Run the game inside a Wine virtual desktop the size of its resolution.
+    /// The game ignores the mouse on a monitor that sits left of or above the
+    /// primary one; inside a virtual desktop there is only one screen.
+    pub virtual_desktop: bool,
+}
+
+impl Default for ProtonSettings {
+    fn default() -> Self {
+        Self { proton: String::new(), env: String::new(), virtual_desktop: true }
+    }
+}
+
+impl ProtonSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// The persisted launcher config: `GenLauncherCfg.yaml`. Mirrors `LauncherData`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
@@ -377,6 +407,11 @@ pub struct LauncherData {
     pub hide_launcher_after_game_start: bool,
     pub first_start: bool,
     pub use_vulkan: bool,
+    /// How Proton runs the game on Linux. Left out of configs written on
+    /// Windows, where it is never used. Configs from the Wine-based builds
+    /// used `Wine:`; its `Env` and `VirtualDesktop` carry over.
+    #[serde(alias = "Wine", skip_serializing_if = "ProtonSettings::is_default")]
+    pub proton: ProtonSettings,
 
     pub modifications: Vec<GameModification>,
     pub addons: Vec<GameModification>,
@@ -400,6 +435,7 @@ impl Default for LauncherData {
             hide_launcher_after_game_start: false,
             first_start: true,
             use_vulkan: false,
+            proton: ProtonSettings::default(),
             modifications: Vec::new(),
             addons: Vec::new(),
             patches: Vec::new(),

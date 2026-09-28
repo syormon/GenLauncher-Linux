@@ -8,8 +8,8 @@ use std::process::Command;
 use std::time::Instant;
 
 use crate::config::{self, Game, SessionInfo};
-use crate::game::{big, symlinks};
-use crate::model::{ModVersion, ModificationType};
+use crate::game::{big, proton, symlinks};
+use crate::model::{ModVersion, ModificationType, ProtonSettings};
 use crate::util::fs as gfs;
 
 /// Loose files a modification may ship that must be hidden before launch.
@@ -100,10 +100,9 @@ pub fn prepare_game_files(
 
 /// With no mod selected, the stock scripts must come back out of the `.GLR` stash.
 fn restore_stock_scripts() {
-    let root = config::game_dir();
     for prefix in ["Data/Scripts", &format!("{}/Data/Scripts", config::STEAM_FOLDER_NAME)] {
         for name in SCRIPT_FILES {
-            let stashed = root.join(format!("{prefix}/{name}{}", config::REPLACE_SUFFIX));
+            let stashed = config::game_path(format!("{prefix}/{name}{}", config::REPLACE_SUFFIX));
             remove_file_suffix(&stashed, config::REPLACE_SUFFIX);
         }
     }
@@ -218,17 +217,15 @@ pub struct RemoteFileInfo {
 /// Compare the installed files against the repository listing.
 /// Mirrors `AreModFilesCorrect`: a missing or mismatching file fails the check.
 pub fn mod_files_are_correct(files: &[RemoteFileInfo]) -> bool {
-    let root = config::game_dir();
-
     for info in files {
-        let declared = root.join(&info.file_name);
+        let declared = config::game_path(&info.file_name);
         let ext = gfs::extension_of(&declared);
         if ext.is_empty() || EXCEPT_EXTENSIONS.contains(&ext.as_str()) {
             continue;
         }
 
         // The file may have been linked in under its .big name.
-        let as_big = gfs::change_extension(&declared, "big");
+        let as_big = config::game_path(gfs::change_extension(Path::new(&info.file_name), "big"));
         let present = if declared.exists() {
             declared
         } else if as_big.exists() {
@@ -263,6 +260,7 @@ pub fn run_game(
     windowed: bool,
     quick_start: bool,
     extra_params: &str,
+    proton: &ProtonSettings,
 ) -> Result<RunOutcome> {
     let executables: Vec<&ModVersion> = versions
         .iter()
@@ -288,25 +286,27 @@ pub fn run_game(
     );
 
     let started = Instant::now();
-    let mut child = spawn_exe(&main_exe, &args).with_context(|| format!("cannot start {main_exe}"))?;
+    let mut child =
+        spawn_exe(&main_exe, &args, proton).with_context(|| format!("cannot start {main_exe}"))?;
 
     // Companion executables (overlays, online clients) run alongside the game.
     for exe in executables
         .iter()
         .filter(|v| !v.info.replaces_original_game_file && !v.info.executable_file_name.is_empty())
     {
-        if let Err(e) = spawn_exe(&exe.info.executable_file_name, &[]) {
+        if let Err(e) = spawn_exe(&exe.info.executable_file_name, &[], proton) {
             log::warn!("could not start {}: {e}", exe.info.executable_file_name);
         }
     }
 
     let _ = child.wait();
+    wait_for_game_processes(&main_exe);
 
     Ok(RunOutcome { played_long_enough: started.elapsed().as_secs() >= 12 })
 }
 
 /// Start World Builder and block until it exits.
-pub fn run_world_builder(versions: &[ModVersion]) -> Result<()> {
+pub fn run_world_builder(versions: &[ModVersion], proton: &ProtonSettings) -> Result<()> {
     let exe = versions
         .iter()
         .find(|v| {
@@ -315,54 +315,62 @@ pub fn run_world_builder(versions: &[ModVersion]) -> Result<()> {
         .map(|v| v.info.executable_file_name.clone())
         .unwrap_or_else(|| "WorldBuilder.exe".to_owned());
 
-    let mut child = spawn_exe(&exe, &[]).with_context(|| format!("cannot start {exe}"))?;
+    let mut child = spawn_exe(&exe, &[], proton).with_context(|| format!("cannot start {exe}"))?;
     let _ = child.wait();
+    wait_for_game_processes(&exe);
     Ok(())
 }
 
 /// Launch a Windows executable from the game folder.
 ///
 /// On Windows this is a direct spawn. Elsewhere the game is a Windows binary,
-/// so it is handed to Wine when one is available.
-fn spawn_exe(exe_name: &str, args: &[String]) -> Result<std::process::Child> {
+/// so it is handed to Proton; anything else (a future native build) runs as is.
+fn spawn_exe(exe_name: &str, args: &[String], settings: &ProtonSettings) -> Result<std::process::Child> {
     let root = config::game_dir();
-    let exe_path = root.join(exe_name);
+    let exe_path = config::game_path(exe_name);
 
-    #[cfg(windows)]
-    {
-        Ok(Command::new(&exe_path).args(args).current_dir(root).spawn()?)
+    if cfg!(windows) || gfs::extension_of(&exe_path) != "exe" {
+        return Ok(Command::new(&exe_path).args(args).current_dir(root).spawn()?);
     }
 
-    #[cfg(not(windows))]
-    {
-        // A native Linux build of the game would be spawned directly.
-        if exe_path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase)
-            != Some("exe".to_owned())
-        {
-            return Ok(Command::new(&exe_path).args(args).current_dir(root).spawn()?);
-        }
-
-        let runner = which_wine().context(
-            "this is a Windows game executable and no `wine` was found on PATH",
-        )?;
-        Ok(Command::new(runner).arg(&exe_path).args(args).current_dir(root).spawn()?)
-    }
+    let runner = proton::Proton::resolve(settings)?;
+    let desktop = virtual_desktop(settings);
+    log::info!(
+        "starting {} with {} (prefix {}, virtual desktop {desktop:?})",
+        exe_path.display(),
+        runner.name(),
+        runner.prefix().display()
+    );
+    Ok(runner.command(&exe_path, root, desktop).args(args).spawn()?)
 }
 
-#[cfg(not(windows))]
-fn which_wine() -> Option<String> {
-    for candidate in ["wine", "wine64"] {
-        if Command::new(candidate)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return Some(candidate.to_owned());
-        }
+/// The Wine virtual desktop to run in, if enabled: the game's own resolution
+/// from `Options.ini`, so the game fills it exactly.
+fn virtual_desktop(settings: &ProtonSettings) -> Option<(u32, u32)> {
+    if !settings.virtual_desktop {
+        return None;
     }
-    None
+    let game = crate::tasks::detect_game().unwrap_or(Game::ZeroHour);
+    let resolution = crate::game::options::GameOptions::load(game, settings)
+        .map(|o| o.resolution())
+        .unwrap_or_default();
+    Some(parse_resolution(&resolution).unwrap_or((1024, 768)))
+}
+
+/// `1920×1080`, as `GameOptions::resolution` writes it.
+fn parse_resolution(text: &str) -> Option<(u32, u32)> {
+    let (width, height) = text.split_once('×')?;
+    Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
+}
+
+/// Under Proton the process we spawned may only be a stub (the retail
+/// `generals.exe` starts `game.dat` and exits), so wait for the real game too.
+fn wait_for_game_processes(exe_name: &str) {
+    if cfg!(windows) {
+        return;
+    }
+    let exe = Path::new(exe_name).file_name().and_then(|n| n.to_str()).unwrap_or(exe_name);
+    proton::wait_for_processes(&[exe, "game.dat"]);
 }
 
 #[cfg(test)]
@@ -380,6 +388,134 @@ mod tests {
             RemoteFileInfo { file_name: "no-extension".into(), hash: "0".into(), size: 0 },
         ];
         assert!(mod_files_are_correct(&files));
+    }
+
+    /// A whole launch under a stand-in Proton in a stand-in Steam library:
+    /// link a mod whose folders are cased differently from the game's, start
+    /// the game, wait out the `game.dat` the retail stub leaves behind, then
+    /// restore the folder.
+    ///
+    /// It claims the process-wide game folder, so it must run on its own:
+    /// `cargo test proton_launch_end_to_end -- --ignored`.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "claims the process-wide game folder; run on its own with --ignored"]
+    fn proton_launch_end_to_end() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let root = std::env::temp_dir().join(format!("gl-e2e-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let steamapps = root.join("steamapps");
+        let game = steamapps.join("common/Zero Hour");
+        let compat = steamapps.join("compatdata/2732960");
+        let docs = compat.join("pfx/drive_c/users/steamuser/Documents");
+
+        fs::create_dir_all(game.join("Data/INI")).unwrap();
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(steamapps.join("appmanifest_2732960.acf"), "\"installdir\" \"Zero Hour\"").unwrap();
+
+        config::set_game_dir(game.clone());
+        assert_eq!(config::game_dir(), game, "another test claimed the game folder first");
+
+        // Mixed-case names, as a copy from a Windows install may have.
+        for name in ["Generals.exe", "BINKW32.DLL", "d3d8.dll"] {
+            fs::write(game.join(name), "").unwrap();
+        }
+        fs::write(game.join("WindowZH.big"), "BIGF").unwrap();
+
+        let mod_dir = game.join("GLM/Test Mod/1.0");
+        fs::create_dir_all(mod_dir.join("data/ini")).unwrap();
+        fs::write(mod_dir.join("data/ini/testmod.ini"), "; test").unwrap();
+        fs::write(mod_dir.join("!TestMod.gib"), "BIGF and some more bytes").unwrap();
+
+        // Logs what it was given, then acts like the retail generals.exe stub:
+        // leaves game.dat running and exits at once.
+        let log = root.join("proton.log");
+        let fake_proton = root.join("Proton Test");
+        fs::create_dir_all(&fake_proton).unwrap();
+        fs::write(
+            fake_proton.join("proton"),
+            format!(
+                "#!/bin/bash\n\
+                 {{ echo \"argv: $*\"; echo \"cwd: $(pwd)\"; echo \"STEAM_COMPAT_DATA_PATH=$STEAM_COMPAT_DATA_PATH\";\n\
+                    echo \"SteamAppId=$SteamAppId\"; echo \"WINEDLLOVERRIDES=$WINEDLLOVERRIDES\";\n\
+                    echo \"WINEDEBUG=$WINEDEBUG\"; echo \"FOO=$FOO\"; find . -type l | sort; }} > '{}'\n\
+                 (exec -a 'C:\\Games\\Zero Hour\\game.dat' sleep 3) >/dev/null 2>&1 &\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(fake_proton.join("proton"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        let version = ModVersion {
+            info: crate::model::ReposVersion {
+                name: "Test Mod".into(),
+                version: "1.0".into(),
+                modification_type: ModificationType::Mod,
+                ..Default::default()
+            },
+            is_selected: true,
+            installed: true,
+        };
+        let session = crate::tasks::session_info(Game::ZeroHour, false);
+
+        prepare_game_files(std::slice::from_ref(&version), &session, 0, true, false, false);
+
+        // The mod's `data/ini` went into the game's `Data/INI`, not beside it.
+        assert!(gfs::is_symlink(&game.join("Data/INI/testmod.ini")));
+        assert!(!game.join("data").exists(), "a second, lower-case data folder was created");
+        assert!(gfs::is_symlink(&game.join("!TestMod.big")));
+
+        let settings = ProtonSettings {
+            proton: fake_proton.display().to_string(),
+            env: "FOO=bar WINEDLLOVERRIDES=dxgi=b".into(),
+            virtual_desktop: false,
+        };
+        let started = Instant::now();
+        run_game(std::slice::from_ref(&version), true, true, "-extra", &settings).unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_secs(3),
+            "returned before game.dat exited ({:?})",
+            started.elapsed()
+        );
+
+        let logged = fs::read_to_string(&log).unwrap();
+        let expect = |needle: &str| {
+            assert!(logged.contains(needle), "proton log lacks {needle:?}:\n{logged}");
+        };
+        expect(&format!(
+            "argv: waitforexitandrun {} -win -quickstart -noshellmap -extra",
+            game.join("Generals.exe").display()
+        ));
+        expect(&format!("cwd: {}", game.display()));
+        expect(&format!("STEAM_COMPAT_DATA_PATH={}", compat.display()));
+        expect("SteamAppId=2732960");
+        expect("WINEDLLOVERRIDES=binkw32,d3d8=n,b;dxgi=b");
+        expect("WINEDEBUG=-all");
+        expect("FOO=bar");
+        // The mod was still linked in while the game ran.
+        expect("./Data/INI/testmod.ini");
+        expect("./!TestMod.big");
+
+        restore_game_folder();
+        assert!(!game.join("Data/INI/testmod.ini").exists());
+        assert!(!game.join("!TestMod.big").exists());
+
+        assert_eq!(
+            config::user_data_dir(Game::ZeroHour, &settings),
+            docs.join("Command and Conquer Generals Zero Hour Data")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parses_the_options_resolution() {
+        assert_eq!(parse_resolution("1920×1080"), Some((1920, 1080)));
+        assert_eq!(parse_resolution(""), None);
+        assert_eq!(parse_resolution("wide×tall"), None);
     }
 
     #[test]

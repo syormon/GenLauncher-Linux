@@ -78,12 +78,12 @@ jobs:
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             binary: genlauncher
-            asset: GenLauncher-${{ needs.version.outputs.version }}-linux-x86_64.tar.gz
+            asset: GenLauncher-${{ needs.version.outputs.version }}-linux-x86_64
           - name: Windows (x86_64)
             os: windows-latest
             target: x86_64-pc-windows-msvc
             binary: genlauncher.exe
-            asset: GenLauncher-${{ needs.version.outputs.version }}-windows-x86_64.zip
+            asset: GenLauncher-${{ needs.version.outputs.version }}-windows-x86_64.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -120,40 +120,25 @@ jobs:
       - name: Test
         run: cargo test --target ${{ matrix.target }}
 
+      # A whole launch through a stand-in Proton. It claims the process-wide
+      # game folder, so it is `#[ignore]`d in the main run and runs alone here.
+      - name: Proton launch end-to-end
+        if: runner.os == 'Linux'
+        run: cargo test --target ${{ matrix.target }} proton_launch_end_to_end -- --ignored
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          set -euo pipefail
-          staging="GenLauncher"
-          mkdir -p "$staging"
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$staging/GenLauncher"
-          cp README.md "$staging/"
-          chmod +x "$staging/GenLauncher"
-          tar -czf "${{ matrix.asset }}" "$staging"
-          sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $staging = 'GenLauncher'
-          New-Item -ItemType Directory -Path $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$staging/GenLauncher.exe"
-          Copy-Item README.md $staging
-          Compress-Archive -Path $staging -DestinationPath "${{ matrix.asset }}"
-          (Get-FileHash "${{ matrix.asset }}" -Algorithm SHA256).Hash.ToLower() + "  ${{ matrix.asset }}" |
-            Out-File -Encoding ascii "${{ matrix.asset }}.sha256"
+      # The release ships the bare executable, renamed so the two platforms'
+      # assets can sit side by side in one release.
+      - name: Stage executable
+        shell: bash
+        run: cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${{ matrix.asset }}"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: |
-            ${{ matrix.asset }}
-            ${{ matrix.asset }}.sha256
+          path: ${{ matrix.asset }}
           if-no-files-found: error
           retention-days: 14
 

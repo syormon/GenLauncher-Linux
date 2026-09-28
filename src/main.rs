@@ -8,6 +8,7 @@
 
 mod app;
 mod config;
+mod desktop_entry;
 mod game;
 mod i18n;
 mod model;
@@ -26,7 +27,7 @@ fn main() -> eframe::Result<()> {
     )
     .init();
 
-    config::set_game_dir(std::env::current_dir().unwrap_or_else(|_| ".".into()));
+    config::set_game_dir(locate_game_dir());
     choose_language();
 
     let Some(game) = preflight() else {
@@ -46,13 +47,18 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(ui::theme::WINDOW_SIZE)
             .with_min_inner_size(egui::vec2(720.0, 520.0))
-            .with_title("GenLauncher"),
+            .with_title("GenLauncher")
+            // Wayland compositors find the window's icon through the .desktop
+            // file named after this id (see `desktop_entry`).
+            .with_app_id(desktop_entry::APP_ID),
         ..Default::default()
     };
 
     if let Some(icon) = load_icon() {
         options.viewport = options.viewport.with_icon(icon);
     }
+    #[cfg(not(windows))]
+    desktop_entry::install(WINDOW_ICON);
 
     eframe::run_native(
         "GenLauncher",
@@ -76,7 +82,7 @@ fn choose_language() {
 fn preflight() -> Option<Game> {
     let dir = config::game_dir();
 
-    let Some(game) = tasks::detect_game().filter(|_| looks_like_a_game_folder()) else {
+    let Some(game) = tasks::detect_game().filter(|_| looks_like_a_game_folder(dir)) else {
         message_box("GenLauncher", &i18n::tr("MoveLauncher"));
         return None;
     };
@@ -92,9 +98,53 @@ fn preflight() -> Option<Game> {
     Some(game)
 }
 
+/// The game folder to manage: an explicit path argument, else the working
+/// directory, else the folder the launcher binary sits in. The last matters
+/// on Linux, where a file manager does not start a program in its own folder.
+/// Failing all of those, a Steam install of the game (Zero Hour first).
+fn locate_game_dir() -> std::path::PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+
+    if let Some(arg) = std::env::args_os().nth(1).map(std::path::PathBuf::from) {
+        if arg.is_dir() {
+            return cwd.join(arg);
+        }
+    }
+    if looks_like_a_game_folder(&cwd) {
+        return cwd;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        .filter(|dir| looks_like_a_game_folder(dir))
+        .or_else(steam_game_dir)
+        .unwrap_or(cwd)
+}
+
+#[cfg(not(windows))]
+fn steam_game_dir() -> Option<std::path::PathBuf> {
+    let mut games: Vec<_> = game::steam::installed_game_dirs()
+        .into_iter()
+        .filter(|dir| looks_like_a_game_folder(dir))
+        .collect();
+    let is_zero_hour = |dir: &std::path::Path| {
+        util::fs::resolve_case_insensitive(dir, "WindowZH.big".as_ref()).exists()
+    };
+    games.sort_by_key(|dir| !is_zero_hour(dir));
+    let dir = games.into_iter().next()?;
+    log::info!("using the Steam install in {}", dir.display());
+    Some(dir)
+}
+
+#[cfg(windows)]
+fn steam_game_dir() -> Option<std::path::PathBuf> {
+    None
+}
+
 /// A real install has the executable, the Bink codec and a window archive.
-fn looks_like_a_game_folder() -> bool {
-    let has = |name: &str| config::game_path(name).exists();
+fn looks_like_a_game_folder(dir: &std::path::Path) -> bool {
+    // Case-insensitive, since a copy on Linux may say `Generals.exe`.
+    let has = |name: &str| util::fs::resolve_case_insensitive(dir, name.as_ref()).exists();
     let has_either = |a: &str, b: &str| has(a) || has(b);
 
     has("generals.exe")
@@ -107,6 +157,8 @@ fn looks_like_a_game_folder() -> bool {
 }
 
 fn message_box(title: &str, message: &str) {
+    // Also to the log: on Linux the dialog needs zenity or kdialog to show.
+    log::error!("{message}");
     rfd::MessageDialog::new()
         .set_title(title)
         .set_description(message)
@@ -114,15 +166,14 @@ fn message_box(title: &str, message: &str) {
         .show();
 }
 
-/// The launcher's own icon, shipped with the original project as `fd.ico`.
-/// Used for the title bar, the taskbar button and Alt+Tab.
-const WINDOW_ICON: &[u8] = include_bytes!("../assets/fd.ico");
+/// The launcher's icon: `assets/icon.png` scaled to 256px. Used for the title
+/// bar, the taskbar button and Alt+Tab.
+const WINDOW_ICON: &[u8] = include_bytes!("../assets/icon-256.png");
 
-/// Decode `fd.ico`. The file holds 16/32/48px entries and the decoder picks the
-/// largest. Returns `None` rather than a blank icon, so a failure leaves the
-/// platform default in place instead of an empty square.
+/// Decode the icon. Returns `None` rather than a blank icon, so a failure
+/// leaves the platform default in place instead of an empty square.
 fn load_icon() -> Option<egui::IconData> {
-    let image = image::load_from_memory_with_format(WINDOW_ICON, image::ImageFormat::Ico)
+    let image = image::load_from_memory_with_format(WINDOW_ICON, image::ImageFormat::Png)
         .inspect_err(|e| log::warn!("could not decode the window icon: {e}"))
         .ok()?;
 
@@ -131,49 +182,40 @@ fn load_icon() -> Option<egui::IconData> {
     Some(egui::IconData { rgba: rgba.into_raw(), width, height })
 }
 
-/// A lock file in the game folder, so a second launcher cannot start there.
+/// An OS lock on a file in the game folder, so a second launcher cannot start
+/// there. The OS drops the lock when the process ends, however it ends, so a
+/// crashed or killed launcher never blocks the next start. The file itself
+/// stays behind; only the lock on it matters.
 struct SingleInstance {
-    path: std::path::PathBuf,
-    _file: std::fs::File,
+    _file: Option<std::fs::File>,
 }
 
 impl SingleInstance {
+    /// `None` when another launcher holds the lock.
     fn acquire() -> Option<Self> {
-        let path = config::game_path(config::LAUNCHER_FOLDER).join("launcher.lock");
+        Self::acquire_at(&config::game_path(config::LAUNCHER_FOLDER).join("launcher.lock"))
+    }
+
+    fn acquire_at(path: &std::path::Path) -> Option<Self> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-
-        // create_new fails when another instance still holds the file.
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => Some(Self { path, _file: file }),
-            Err(_) if lock_is_stale(&path) => {
-                let _ = std::fs::remove_file(&path);
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                    .ok()
-                    .map(|file| Self { path, _file: file })
+        let file = match std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path) {
+            Ok(file) => file,
+            Err(e) => {
+                // A lock we cannot even open must not stop the launcher.
+                log::warn!("cannot open {}: {e}; not guarding against a second launcher", path.display());
+                return Some(Self { _file: None });
             }
-            Err(_) => None,
+        };
+        match file.try_lock() {
+            Ok(()) => Some(Self { _file: Some(file) }),
+            Err(std::fs::TryLockError::WouldBlock) => None,
+            Err(std::fs::TryLockError::Error(e)) => {
+                log::warn!("cannot lock {}: {e}; not guarding against a second launcher", path.display());
+                Some(Self { _file: None })
+            }
         }
-    }
-}
-
-/// A lock left behind by a crash should not block the launcher forever.
-fn lock_is_stale(path: &std::path::Path) -> bool {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .map(|modified| {
-            modified.elapsed().map(|age| age > std::time::Duration::from_secs(8 * 3600)).unwrap_or(false)
-        })
-        .unwrap_or(false)
-}
-
-impl Drop for SingleInstance {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -216,6 +258,12 @@ impl eframe::App for Launcher {
             }
         }
 
+        // Closing the window while a game runs would unlink its mod files.
+        if ctx.input(|i| i.viewport().close_requested()) && self.app.launch_in_progress() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.app.request_quit();
+        }
+
         if self.app.quit_requested() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -235,7 +283,7 @@ mod tests {
 
     #[test]
     fn the_window_icon_decodes_to_a_usable_image() {
-        let icon = load_icon().expect("fd.ico must decode");
+        let icon = load_icon().expect("the icon must decode");
 
         assert_eq!(icon.width, icon.height, "the icon should be square");
         // egui wants the dimensions to be a multiple of 4.
@@ -245,9 +293,20 @@ mod tests {
             (icon.width * icon.height * 4) as usize,
             "RGBA buffer does not match the stated size"
         );
-        // The decoder should pick the largest entry in the file (48px), not the 16px one.
-        assert!(icon.width >= 32, "expected the largest entry, got {}px", icon.width);
+        assert!(icon.width >= 128, "expected the 256px icon, got {}px", icon.width);
         assert!(icon.rgba.chunks_exact(4).any(|px| px[3] > 0), "icon is fully transparent");
+    }
+
+    #[test]
+    fn only_one_launcher_holds_the_lock_and_it_frees_on_exit() {
+        let path = std::env::temp_dir().join(format!("gl-lock-{}/launcher.lock", std::process::id()));
+        let first = SingleInstance::acquire_at(&path).expect("the first launcher gets the lock");
+        assert!(SingleInstance::acquire_at(&path).is_none(), "a second launcher must be refused");
+
+        // Closing the file is what the OS does for a process that dies.
+        drop(first);
+        assert!(SingleInstance::acquire_at(&path).is_some(), "the lock must be free again");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
 

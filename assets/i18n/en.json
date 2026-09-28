@@ -60,6 +60,8 @@
  "FirstRun": "Looks like you are running the game for the first time",
  "GameIsStillRunning": "Game is still running!",
  "GameRunning": "Generals game is already running!",
+ "GameStillRunning": "Game still running",
+ "CloseWhileRunning": "Close the game before closing GenLauncher. On exit GenLauncher removes the mod files from the game folder, which would break a game that is still running.",
  "GentoolRecommended": "(Gentool recommended)",
  "HeatEffects": "Heat Effects (recommended to turn off)",
  "HideLauncher": "Hide GenLauncher while the game is running",
@@ -140,5 +142,11 @@
  "WarningOption": "WARNING! This check may take a long time before starting the game!",
  "WorldBuilder": "WORLD BUILDER",
  "WorldBuilderRunning": "World Builder is already running!",
- "Yes": "Yes"
+ "Yes": "Yes",
+ "Browse": "Browse...",
+ "ProtonBuild": "Proton:",
+ "ProtonBuildHint": "the Proton Steam runs the game with",
+ "ProtonEnv": "Environment variables:",
+ "ProtonConfigure": "Open winecfg",
+ "ProtonVirtualDesktop": "Run the game in a Wine virtual desktop (needed for the mouse to work on a second monitor)"
 }

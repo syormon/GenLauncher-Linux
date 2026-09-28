@@ -196,6 +196,49 @@ pub fn visit_dirs(dir: &Path, visit: &mut impl FnMut(&Path)) {
     }
 }
 
+/// Resolve `rel` under `root` the way Windows (and Wine) would: a component
+/// that already exists under a different case is matched to that entry, so a
+/// mod's `data/ini` lands in the game's `Data/INI` instead of beside it.
+/// Components past the first one that does not exist are kept as given.
+pub fn resolve_case_insensitive(root: &Path, rel: &Path) -> PathBuf {
+    let mut resolved = root.to_path_buf();
+    let mut components = rel.components();
+
+    for component in components.by_ref() {
+        let std::path::Component::Normal(want) = component else {
+            resolved.push(component);
+            continue;
+        };
+
+        // An exact hit is the common case and needs no directory scan. Windows
+        // reports one for any casing, so there the scan below always decides.
+        let exact = resolved.join(want);
+        if cfg!(unix) && fs::symlink_metadata(&exact).is_ok() {
+            resolved = exact;
+            continue;
+        }
+
+        let want = want.to_string_lossy();
+        let found = fs::read_dir(&resolved).ok().and_then(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name())
+                .find(|name| name.to_string_lossy().eq_ignore_ascii_case(&want))
+        });
+
+        match found {
+            Some(name) => resolved.push(name),
+            None => {
+                resolved.push(want.as_ref());
+                break;
+            }
+        }
+    }
+
+    resolved.extend(components);
+    resolved
+}
+
 /// Strip characters .NET rejects in file names, so mod names can become folders.
 pub fn sanitize_file_name(name: &str) -> String {
     name.chars().filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') && !c.is_control())
@@ -212,6 +255,24 @@ mod tests {
     fn change_extension_matches_dotnet() {
         assert_eq!(change_extension(Path::new("a/b.gib"), "big"), PathBuf::from("a/b.big"));
         assert_eq!(change_extension(Path::new("a/b"), "big"), PathBuf::from("a/b.big"));
+    }
+
+    #[test]
+    fn resolves_paths_against_the_existing_casing() {
+        let root = std::env::temp_dir().join(format!("gl-case-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Data").join("INI")).unwrap();
+        fs::write(root.join("Data").join("INI").join("GameData.ini"), b"").unwrap();
+
+        let resolve = |rel: &str| resolve_case_insensitive(&root, Path::new(rel));
+
+        // Every existing component takes the casing on disk.
+        assert_eq!(resolve("data/ini/gamedata.ini"), root.join("Data").join("INI").join("GameData.ini"));
+        // The first missing component, and all after it, stay as given.
+        assert_eq!(resolve("DATA/Scripts/x.scb"), root.join("Data").join("Scripts").join("x.scb"));
+        assert_eq!(resolve("NewDir"), root.join("NewDir"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

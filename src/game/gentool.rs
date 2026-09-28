@@ -1,12 +1,8 @@
 //! GenTool version handling. Port of `GentoolHandler`.
 //! The HTTP calls live in `net::gentool`; this module is the pure logic.
 //!
-//! Note: the C# build defined `CheckAndUpdateGentool` but never called it, so
-//! the auto-update the options screen advertises has not actually run since
-//! that method was orphaned. The check is ported here so it can be wired up,
-//! but it is deliberately left uncalled to keep this migration behaviour-for-
-//! behaviour with the original.
-#![allow(dead_code)]
+//! The C# build defined `CheckAndUpdateGentool` but never called it. Here the
+//! launch runs it whenever "Install and autoupdate Gentool" is on.
 
 use std::path::Path;
 
@@ -14,7 +10,6 @@ use crate::config;
 use crate::util::pe_version;
 
 pub const GENTOOL_SITE: &str = "https://www.gentool.net/";
-pub const GENTOOL_SITE_HTTP: &str = "http://www.gentool.net/";
 
 const GENTOOL_DLL: &str = "d3d8.dll";
 const GENTOOL_CFG: &str = "d3d8.cfg";
@@ -46,7 +41,7 @@ pub fn is_outdated(current: i64, latest: &str) -> bool {
 }
 
 pub fn download_link(latest_version: &str) -> String {
-    format!("http://www.gentool.net/download/GenTool_v{latest_version}.zip")
+    format!("{GENTOOL_SITE}download/GenTool_v{latest_version}.zip")
 }
 
 fn digits_only(s: &str) -> String {
@@ -88,6 +83,22 @@ pub fn extract_default_cfg() -> std::io::Result<()> {
 /// Path of GenTool's DLL inside the game folder.
 pub fn dll_path() -> std::path::PathBuf {
     config::game_path(GENTOOL_DLL)
+}
+
+/// Put the `d3d8.dll` from an unpacked GenTool download into the game folder.
+pub fn install_dll_from(unpacked: &Path) -> anyhow::Result<()> {
+    let mut found = None;
+    crate::util::fs::visit_files(unpacked, &mut |file| {
+        if found.is_none() && crate::util::fs::file_name_of(file).eq_ignore_ascii_case(GENTOOL_DLL) {
+            found = Some(file.to_path_buf());
+        }
+    });
+    let dll = found.ok_or_else(|| anyhow::anyhow!("the download has no {GENTOOL_DLL}"))?;
+
+    let target = dll_path();
+    let _ = std::fs::remove_file(&target);
+    std::fs::copy(&dll, &target)?;
+    Ok(())
 }
 
 /// Move GenTool's DLL out of the way (used when the user disables it).

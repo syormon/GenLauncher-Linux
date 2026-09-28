@@ -5,9 +5,10 @@ use egui::{Context, RichText};
 
 use crate::app::GenLauncherApp;
 use crate::config::{self, Game};
-use crate::game::gentool;
 use crate::game::options::{self, GameOptions, RESOLUTIONS, TOGGLE_KEYS};
+use crate::game::{gentool, proton};
 use crate::i18n;
+use crate::model::ProtonSettings;
 use crate::util;
 
 pub struct OptionsState {
@@ -21,36 +22,61 @@ pub struct OptionsState {
     use_custom_camera: bool,
     game_params: String,
     force_english: bool,
+    /// Edited copy of the Proton settings, saved on Apply.
+    proton: ProtonSettings,
+    /// What a launch would run with, or why it cannot.
+    proton_status: Result<String, String>,
 }
 
 impl OptionsState {
     pub fn open(app: &GenLauncherApp) -> Self {
-        let loaded = GameOptions::load(app.session.game_mode);
-
-        let (options, load_error) = match loaded {
-            Ok(o) => (Some(o), None),
-            Err(e) => (None, Some(format!("{e:#}"))),
-        };
-
-        let resolution = options.as_ref().map(|o| o.resolution()).unwrap_or_default();
-        let particles = options.as_ref().map(|o| o.int("MaxParticleCount", 2500)).unwrap_or(2500);
-        let texture_quality = options
-            .as_ref()
-            .map(|o| options::invert_texture_reduction(o.int("TextureReduction", 1)))
-            .unwrap_or(1);
-
-        Self {
-            options,
-            load_error,
-            resolution,
-            particles,
-            texture_quality,
+        let proton = app.store.data.proton.clone();
+        let mut state = Self {
+            options: None,
+            load_error: None,
+            resolution: String::new(),
+            particles: 2500,
+            texture_quality: 1,
             camera_height: app.store.data.camera_height,
             use_custom_camera: app.store.data.camera_height != 0,
             game_params: app.store.data.game_params.clone(),
             force_english: english_marker().is_file(),
-        }
+            proton_status: proton_status(&proton),
+            proton,
+        };
+        state.load_game_options(app.session.game_mode);
+        state
     }
+
+    /// Read `Options.ini`, which under Proton lives in the prefix's Documents.
+    fn load_game_options(&mut self, game: Game) {
+        let (options, load_error) = match GameOptions::load(game, &self.proton) {
+            Ok(o) => (Some(o), None),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        };
+
+        self.resolution = options.as_ref().map(|o| o.resolution()).unwrap_or_default();
+        self.particles = options.as_ref().map(|o| o.int("MaxParticleCount", 2500)).unwrap_or(2500);
+        self.texture_quality = options
+            .as_ref()
+            .map(|o| options::invert_texture_reduction(o.int("TextureReduction", 1)))
+            .unwrap_or(1);
+        self.options = options;
+        self.load_error = load_error;
+    }
+
+    /// A different Proton may mean a different prefix, and `Options.ini`.
+    fn proton_changed(&mut self, game: Game) {
+        self.proton_status = proton_status(&self.proton);
+        self.load_game_options(game);
+    }
+}
+
+fn proton_status(settings: &ProtonSettings) -> Result<String, String> {
+    if cfg!(windows) {
+        return Ok(String::new());
+    }
+    proton::describe(settings).map_err(|e| format!("{e:#}"))
 }
 
 /// A file named `eng` in the launcher folder pins the UI to English.
@@ -200,6 +226,11 @@ fn launcher_settings(app: &mut GenLauncherApp, state: &mut OptionsState, ui: &mu
         );
     }
 
+    if cfg!(not(windows)) {
+        ui.add_space(6.0);
+        proton_settings(app, state, ui);
+    }
+
     ui.add_space(8.0);
     ui.label(RichText::new(i18n::tr("AdditionalParams")).size(13.0));
     ui.add(egui::TextEdit::singleline(&mut state.game_params).desired_width(f32::INFINITY));
@@ -237,6 +268,59 @@ fn launcher_settings(app: &mut GenLauncherApp, state: &mut OptionsState, ui: &mu
             }
         }
     });
+}
+
+/// The game is a Windows program; off Windows it runs through Steam's Proton.
+fn proton_settings(app: &GenLauncherApp, state: &mut OptionsState, ui: &mut egui::Ui) {
+    let palette = app.palette;
+    crate::ui::theme::heading(ui, &palette, "Proton");
+    let mut changed = false;
+
+    ui.label(RichText::new(i18n::tr("ProtonBuild")).size(13.0));
+    ui.horizontal(|ui| {
+        let width = ui.available_width() - 80.0;
+        changed |= ui
+            .add(
+                egui::TextEdit::singleline(&mut state.proton.proton)
+                    .hint_text(i18n::tr("ProtonBuildHint"))
+                    .desired_width(width),
+            )
+            .lost_focus();
+        if ui.button(i18n::tr("Browse")).clicked() {
+            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                state.proton.proton = path.display().to_string();
+                changed = true;
+            }
+        }
+    });
+
+    ui.label(RichText::new(i18n::tr("ProtonEnv")).size(13.0));
+    changed |= ui
+        .add(
+            egui::TextEdit::singleline(&mut state.proton.env)
+                .hint_text("DXVK_HUD=fps PROTON_LOG=1")
+                .desired_width(f32::INFINITY),
+        )
+        .lost_focus();
+
+    changed |= ui.checkbox(&mut state.proton.virtual_desktop, i18n::tr("ProtonVirtualDesktop")).changed();
+
+    if changed {
+        state.proton_changed(app.session.game_mode);
+    }
+
+    match &state.proton_status {
+        Ok(text) => ui.label(RichText::new(text).size(11.0).color(palette.inactive_border)),
+        Err(error) => {
+            ui.label(RichText::new(error).size(11.0).color(egui::Color32::from_rgb(220, 70, 60)))
+        }
+    };
+
+    if ui.button(i18n::tr("ProtonConfigure")).clicked() {
+        if let Err(e) = proton::open_winecfg(&state.proton) {
+            state.proton_status = Err(format!("{e:#}"));
+        }
+    }
 }
 
 fn game_settings(app: &mut GenLauncherApp, state: &mut OptionsState, ui: &mut egui::Ui) {
@@ -314,6 +398,7 @@ fn apply(app: &mut GenLauncherApp, state: &mut OptionsState) {
     }
 
     app.store.data.game_params = state.game_params.clone();
+    app.store.data.proton = state.proton.clone();
     app.store.data.camera_height = if state.use_custom_camera { state.camera_height } else { 0 };
     app.store.save();
 }

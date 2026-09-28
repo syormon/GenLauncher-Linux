@@ -485,7 +485,7 @@ fn open_mod_folder(app: &mut GenLauncherApp, kind: ModificationType, name: &str)
 }
 
 fn open_user_folder(app: &mut GenLauncherApp, sub: &str) {
-    let folder = config::user_data_dir(app.session.game_mode).join(sub);
+    let folder = config::user_data_dir(app.session.game_mode, &app.store.data.proton).join(sub);
     if folder.is_dir() {
         util::open_external(&folder.to_string_lossy());
     } else {
@@ -623,24 +623,6 @@ fn side_panel(app: &mut GenLauncherApp, ui: &mut egui::Ui) {
             22.0,
         );
     }
-
-    ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-        ui.add_space(6.0);
-        if ui
-            .add(
-                egui::Label::new(
-                    RichText::new(i18n::tr("JoinDiscord"))
-                        .size(13.0)
-                        .color(app.palette.active)
-                        .underline(),
-                )
-                .sense(egui::Sense::click()),
-            )
-            .clicked()
-        {
-            util::open_external(config::GENLAUNCHER_DISCORD);
-        }
-    });
 }
 
 /// Settings that only make sense for Zero Hour are forced off for Generals,

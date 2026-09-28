@@ -670,21 +670,38 @@ pub async fn simple_file(
     let name = file_name_from_response(&response, url);
     let destination = target_dir.join(&name);
 
-    let mut file = tokio::fs::File::create(&destination).await?;
-    let mut stream = response.bytes_stream();
-    let mut read = 0u64;
+    // Written under a temporary name and renamed only once complete, so an
+    // interrupted download never leaves a truncated file that later looks
+    // installed (a cut-off `modded.exe` would otherwise be run every launch).
+    let partial = target_dir.join(format!("{name}.part"));
+    let result = async {
+        let mut file = tokio::fs::File::create(&partial).await?;
+        let mut stream = response.bytes_stream();
+        let mut read = 0u64;
 
-    while let Some(chunk) = tokio::time::timeout(STALL_TIMEOUT, stream.next())
-        .await
-        .map_err(|_| TransientError)?
-    {
-        let chunk = chunk?;
-        file.write_all(&chunk).await?;
-        read += chunk.len() as u64;
-        on_progress(total, read);
+        while let Some(chunk) = tokio::time::timeout(STALL_TIMEOUT, stream.next())
+            .await
+            .map_err(|_| TransientError)?
+        {
+            let chunk = chunk?;
+            file.write_all(&chunk).await?;
+            read += chunk.len() as u64;
+            on_progress(total, read);
+        }
+        file.flush().await?;
+        drop(file);
+
+        if let Some(total) = total.filter(|total| *total != read) {
+            anyhow::bail!("{name}: the download ended after {read} of {total} bytes");
+        }
+        tokio::fs::rename(&partial, &destination).await?;
+        Ok(())
     }
-    file.flush().await?;
-    drop(file);
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&partial).await;
+    }
+    result?;
 
     if extract && archive::is_supported_archive(&destination) {
         let destination_for_task = destination.clone();

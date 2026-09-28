@@ -63,6 +63,22 @@ pub fn file_contains_game_data_ini(path: &Path) -> bool {
     }
 }
 
+/// Position of the `=` in the `MaxCameraHeight = …` line. The key must stand
+/// on its own: `EnforceMaxCameraHeight` two lines further down contains it
+/// too. Where the line sits varies by mod, so the whole file is searched.
+fn camera_height_equals(ini: &[u8]) -> Option<usize> {
+    const KEY: &[u8] = b"MaxCameraHeight";
+    (0..ini.len().saturating_sub(KEY.len())).find_map(|at| {
+        let starts_word = at == 0 || !ini[at - 1].is_ascii_alphanumeric();
+        if !starts_word || !ini[at..].starts_with(KEY) {
+            return None;
+        }
+        let rest = &ini[at + KEY.len()..];
+        let spaces = rest.iter().take_while(|b| **b == b' ' || **b == b'\t').count();
+        (rest.get(spaces) == Some(&b'=')).then_some(at + KEY.len() + spaces)
+    })
+}
+
 /// Overwrite the `MaxCameraHeight` value inside the archive's `GameData.ini`.
 ///
 /// The value is patched in place so the surrounding bytes, and therefore every
@@ -82,15 +98,10 @@ pub fn set_camera_height(path: &Path, height: i32) -> Result<()> {
     file.read_exact(&mut buf)?;
     drop(file);
 
-    let text = String::from_utf8_lossy(&buf).into_owned();
-
-    // The original skips the first 3000 characters to reach the gameplay block.
-    let search_start = 3000.min(text.len());
-    let Some(key_at) = text[search_start..].find("MaxCameraHeight").map(|i| i + search_start)
-    else {
-        return Ok(());
-    };
-    let Some(eq_at) = text[key_at + 14..].find('=').map(|i| i + key_at + 14) else {
+    // Search the raw bytes: mods' INI files are not always UTF-8, and a lossy
+    // conversion would shift every offset after an invalid byte, so the value
+    // would be written over the wrong bytes of the archive.
+    let Some(eq_at) = camera_height_equals(&buf) else {
         return Ok(());
     };
 
@@ -170,5 +181,59 @@ mod tests {
         assert!(!is_big_archive(&other));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A one-file archive holding `Data\INI\GameData.ini` with `ini`.
+    fn archive_with_game_data(path: &Path, ini: &[u8]) {
+        let name = b"Data\\INI\\GameData.ini\0";
+        let header_len = 16 + 8 + name.len();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"BIGF");
+        out.extend_from_slice(&((header_len + ini.len()) as u32).to_le_bytes());
+        out.extend_from_slice(&1u32.to_be_bytes());
+        out.extend_from_slice(&(header_len as u32).to_be_bytes());
+        out.extend_from_slice(&(header_len as u32).to_be_bytes());
+        out.extend_from_slice(&(ini.len() as u32).to_be_bytes());
+        out.extend_from_slice(name);
+        out.extend_from_slice(ini);
+        std::fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    fn patches_the_camera_height_after_non_utf8_bytes() {
+        let dir = std::env::temp_dir().join(format!("gl-big-cam-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ini.big");
+
+        // Windows-1252 bytes (é, à, ©) before the key, which a lossy UTF-8
+        // conversion would have turned into 3-byte replacement characters.
+        let mut ini = b"; Mod d\xe9j\xe0 vu \xa9\r\nGameData\r\n".to_vec();
+        ini.extend_from_slice(b"  MaxCameraHeight = 310.0\r\n  EnforceMaxCameraHeight = No      ; Obey\r\nEnd\r\n");
+        archive_with_game_data(&path, &ini);
+
+        set_camera_height(&path, 600).unwrap();
+
+        let entry = read_entries(&path).unwrap().remove(0);
+        let bytes = std::fs::read(&path).unwrap();
+        let data = &bytes[entry.offset as usize..][..entry.length as usize];
+        let expected = [
+            &ini[..27],
+            b"  MaxCameraHeight =600.00\r\n  EnforceMaxCameraHeight = No      ; Obey\r\nEnd\r\n".as_slice(),
+        ]
+        .concat();
+        assert_eq!(data, expected.as_slice(), "{:?}", String::from_utf8_lossy(data));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finds_the_camera_key_on_its_own_only() {
+        // Only `EnforceMaxCameraHeight`: nothing to patch.
+        assert_eq!(camera_height_equals(b"  EnforceMaxCameraHeight = No\r\n"), None);
+        // The real key after an Enforce line still wins, with any spacing.
+        let ini = b"  EnforceMaxCameraHeight = No\r\n  MaxCameraHeight\t= 390.0\r\n";
+        let eq = camera_height_equals(ini).unwrap();
+        assert_eq!(ini[eq], b'=');
+        assert!(ini[..eq].ends_with(b"  MaxCameraHeight\t"));
     }
 }

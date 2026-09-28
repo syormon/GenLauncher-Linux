@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::config::{self, Game};
+use crate::model::ProtonSettings;
 
 const DEFAULT_OPTIONS: &str = include_str!("../../assets/options.ini");
 
@@ -38,8 +39,8 @@ pub struct GameOptions {
 }
 
 impl GameOptions {
-    pub fn load(game: Game) -> Result<Self> {
-        let folder = config::user_data_dir(game);
+    pub fn load(game: Game, proton: &ProtonSettings) -> Result<Self> {
+        let folder = config::user_data_dir(game, proton);
         std::fs::create_dir_all(&folder)?;
         let path = folder.join("Options.ini");
 

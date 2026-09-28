@@ -541,6 +541,22 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_wine_section_of_older_linux_configs() {
+        let yaml = "Windowed: true\nWine:\n  Binary: /usr/bin/wine\n  Prefix: ~/.wine\n  Env: DXVK_HUD=fps\n  VirtualDesktop: false\n";
+        let data: LauncherData = serde_yaml_ng::from_str(yaml).unwrap();
+        // The Wine binary and prefix no longer apply; the rest carries over.
+        assert_eq!(data.proton.proton, "");
+        assert_eq!(data.proton.env, "DXVK_HUD=fps");
+        assert!(!data.proton.virtual_desktop);
+
+        let yaml = serde_yaml_ng::to_string(&data).unwrap();
+        assert!(yaml.contains("Proton:") && !yaml.contains("Wine:"), "{yaml}");
+        // Nothing to write when every Proton setting is left at its default.
+        let yaml = serde_yaml_ng::to_string(&LauncherData::default()).unwrap();
+        assert!(!yaml.contains("Proton:"), "{yaml}");
+    }
+
+    #[test]
     fn reads_a_config_written_by_the_csharp_build() {
         let yaml = r#"
 ModdedExe: true

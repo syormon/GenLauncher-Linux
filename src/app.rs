@@ -378,6 +378,9 @@ impl GenLauncherApp {
 
             Bg::GamePrepared { world_builder, ok } => {
                 self.busy = false;
+                if ok && !world_builder && self.store.data.hide_launcher_after_game_start {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
                 if !ok {
                     self.game_running = false;
                     self.world_builder_running = false;
@@ -391,6 +394,10 @@ impl GenLauncherApp {
 
             Bg::GameFinished { world_builder, played_long_enough, error } => {
                 self.busy = false;
+                if !world_builder && self.store.data.hide_launcher_after_game_start {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
                 if world_builder {
                     self.world_builder_running = false;
                 } else {
@@ -632,14 +639,25 @@ impl GenLauncherApp {
         self.quit_requested
     }
 
+    /// True while a game or World Builder started from here is still running.
+    pub fn launch_in_progress(&self) -> bool {
+        self.game_running || self.world_builder_running
+    }
+
+    /// Quit, unless a game is still running: exiting restores the game folder,
+    /// which would pull the mod's files out from under it.
     pub fn request_quit(&mut self) {
+        if self.launch_in_progress() {
+            self.show_dialog(Dialog::info(i18n::tr("GameStillRunning"), i18n::tr("CloseWhileRunning")));
+            return;
+        }
         self.quit_requested = true;
     }
 
     // -- options ----------------------------------------------------------
 
     pub fn apply_default_options(&mut self) {
-        match GameOptions::load(self.session.game_mode) {
+        match GameOptions::load(self.session.game_mode, &self.store.data.proton) {
             Ok(mut options) => {
                 if let Err(e) = options.apply_defaults(primary_screen_size()) {
                     log::warn!("could not write Options.ini: {e:#}");
@@ -859,6 +877,8 @@ impl GenLauncherApp {
             return;
         }
 
+        let modded_exe = if world_builder { None } else { self.modded_exe_for(&versions) };
+
         self.busy = true;
         if world_builder {
             self.world_builder_running = true;
@@ -881,10 +901,32 @@ impl GenLauncherApp {
                 game_params: self.store.data.game_params.clone(),
                 use_vulkan: self.store.data.use_vulkan,
                 gentool_auto_update: self.store.data.auto_update_gentool,
+                modded_exe,
                 vulkan: self.store.repos.vulkan.clone(),
+                proton: self.store.data.proton.clone(),
             },
             self.tx.clone(),
         );
+    }
+
+    /// The repository's modded executable, when "Use modded exe files" is on
+    /// and nothing selected already replaces the game executable. The Steam
+    /// edition's own executable stops at "Failed to fetch Steam App Name!".
+    fn modded_exe_for(&self, versions: &[ModVersion]) -> Option<ModVersion> {
+        let replaced = versions
+            .iter()
+            .any(|v| v.kind() == ModificationType::Executable && v.info.replaces_original_game_file);
+        if !self.store.data.modded_exe || self.session.game_mode != Game::ZeroHour || replaced {
+            return None;
+        }
+        self.store
+            .data
+            .exes
+            .iter()
+            .find(|m| m.name().eq_ignore_ascii_case(config::MODDED_EXE_NAME))
+            .and_then(|m| m.latest_version())
+            .filter(|v| v.info.replaces_original_game_file)
+            .cloned()
     }
 
     // -- tab switching -----------------------------------------------------

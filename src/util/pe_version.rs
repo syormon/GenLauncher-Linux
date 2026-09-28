@@ -185,7 +185,7 @@ mod tests {
         let mut blob = vec![0u8; 6];
         blob.extend("FileVersion".encode_utf16().flat_map(u16::to_le_bytes));
         blob.extend([0, 0]);
-        while blob.len() % 4 != 0 {
+        while !blob.len().is_multiple_of(4) {
             blob.push(0);
         }
         blob.extend("7.4.2.0".encode_utf16().flat_map(u16::to_le_bytes));
