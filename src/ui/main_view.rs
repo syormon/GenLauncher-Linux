@@ -4,6 +4,7 @@ use egui::{Align, Context, Layout, RichText, Vec2};
 
 use crate::app::{Dialog, GenLauncherApp, Tab};
 use crate::config::{self, Game};
+use crate::game::mod_archive;
 use crate::i18n;
 use crate::model::{ModificationType, GameModification};
 use crate::ui::dialogs::{ManualAddState, AddModState};
@@ -156,6 +157,9 @@ fn add_buttons(app: &mut GenLauncherApp, ui: &mut egui::Ui) {
         if app.busy {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add(egui::Spinner::new().size(18.0).color(app.palette.active));
+                if !app.busy_status.is_empty() {
+                    ui.label(RichText::new(&app.busy_status).size(12.0));
+                }
             });
         }
     });
@@ -166,12 +170,33 @@ fn start_manual_add(app: &mut GenLauncherApp, kind: ModificationType) {
     if files.is_empty() {
         return;
     }
+
+    // Stop before asking for a name if an archive cannot be unpacked here.
+    // zip and 7z always can; rar needs 7-Zip or UnRAR to be installed.
+    if let Some(blocked) = files
+        .iter()
+        .find(|f| util::archive::is_supported_archive(f) && !util::archive::can_extract(f))
+    {
+        app.show_dialog(Dialog::error(
+            i18n::tr("OperationAborted"),
+            i18n::trf("RarToolMissing", &[&gfs::file_name_of(blocked)]),
+        ));
+        return;
+    }
+
+    // An archive's file name usually carries both; the user confirms them.
+    let (name, version) = files
+        .iter()
+        .find(|f| util::archive::is_supported_archive(f))
+        .map(|f| mod_archive::guess_name_and_version(&gfs::file_name_of(f)))
+        .unwrap_or_default();
+
     app.manual_add = Some(ManualAddState {
         files,
         kind,
         dependency: app.store.dependency_name(),
-        name: String::new(),
-        version: String::new(),
+        name,
+        version,
         error: None,
     });
 }

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
 use crate::config::{self, Game, SessionInfo};
+use crate::game::mod_archive::InstallReport;
 use crate::game::{self, launcher, stock_files};
 use crate::model::repos::VulkanData;
 use crate::model::{ModVersion, ModificationType, ReposVersion, ProtonSettings};
@@ -30,8 +31,12 @@ pub enum Bg {
     ModAdded { version: Box<ReposVersion>, extras: Vec<ReposVersion> },
     /// Patches and addons for the base game arrived.
     OriginalGameExtras(Vec<ReposVersion>),
+    /// One line of progress while files are being added by hand.
+    ManualAddStatus(String),
     /// Files were unpacked into the mod store by hand; rescan is needed.
-    ManualAddDone { error: Option<String> },
+    /// `archives` are the archives that were installed, so the user can be
+    /// offered their deletion; it is empty when the install failed.
+    ManualAddDone { error: Option<String>, archives: Vec<PathBuf>, report: InstallReport },
     /// Progress of the side-bar download (the Vulkan layer).
     SideProgress { label: String, total: Option<u64>, read: u64 },
     /// The side-bar download finished.
@@ -804,41 +809,67 @@ fn verify_mod_files(
     }
 }
 
-/// Copy the files the user picked into the mod store, unpacking archives.
+/// Install the files the user picked into the mod store, unpacking archives.
 pub fn spawn_manual_add(
     runtime: &tokio::runtime::Runtime,
     files: Vec<PathBuf>,
     target_relative: String,
+    game: Game,
     tx: Sender<Bg>,
 ) {
     runtime.spawn_blocking(move || {
         let target = config::game_path(&target_relative);
-        let error = install_files(&files, &target).err().map(|e| format!("{e:#}"));
-        let _ = tx.send(Bg::ManualAddDone { error });
+        let status_tx = tx.clone();
+        let status = move |text: &str| {
+            let _ = status_tx.send(Bg::ManualAddStatus(text.to_owned()));
+        };
+
+        let message = match install_files(&files, &target, game, &status) {
+            Ok(report) => Bg::ManualAddDone {
+                error: None,
+                archives: files
+                    .into_iter()
+                    .filter(|f| crate::util::archive::is_supported_archive(f))
+                    .collect(),
+                report,
+            },
+            Err(e) => Bg::ManualAddDone {
+                error: Some(format!("{e:#}")),
+                archives: Vec::new(),
+                report: InstallReport::default(),
+            },
+        };
+        let _ = tx.send(message);
     });
 }
 
-/// Port of `ModificationsFileHandler.ExtractModificationFromFiles`.
-fn install_files(files: &[PathBuf], target: &std::path::Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(target)?;
+/// Port of `ModificationsFileHandler.ExtractModificationFromFiles`. Archives
+/// are unpacked straight from where they are, never copied first.
+fn install_files(
+    files: &[PathBuf],
+    target: &std::path::Path,
+    game: Game,
+    status: &dyn Fn(&str),
+) -> anyhow::Result<InstallReport> {
+    let mut report = InstallReport::default();
 
     for file in files {
-        let name = gfs::file_name_of(file);
-        let copied = target.join(&name);
+        if crate::util::archive::is_supported_archive(file) {
+            report.merge(&game::mod_archive::install(file, target, game, status)?);
+            continue;
+        }
 
+        std::fs::create_dir_all(target)?;
+        let copied = target.join(gfs::file_name_of(file));
         if !copied.exists() {
             std::fs::copy(file, &copied)?;
         }
-
-        if crate::util::archive::is_supported_archive(&copied) {
-            crate::util::archive::extract(&copied, target, true)?;
-            std::fs::remove_file(&copied)?;
-        } else if gfs::extension_of(&copied) == "big" {
+        if gfs::extension_of(&copied) == "big" {
             // Stored as .gib so the game only sees it once it is linked in.
             let gib = gfs::change_extension(&copied, "gib");
             let _ = std::fs::remove_file(&gib);
             gfs::move_file(&copied, &gib)?;
         }
     }
-    Ok(())
+    Ok(report)
 }

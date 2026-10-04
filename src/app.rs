@@ -41,6 +41,8 @@ pub enum DialogId {
     ConfirmIntegrity { world_builder: bool },
     SyncSystemTime { key: ModKey },
     DownloadDeprecated { key: ModKey },
+    /// Delete the archives a mod was just installed from.
+    DeleteArchives { files: Vec<std::path::PathBuf> },
 }
 
 pub struct Dialog {
@@ -131,6 +133,8 @@ pub struct GenLauncherApp {
     pending_dialogs: Vec<Dialog>,
 
     pub busy: bool,
+    /// What the busy spinner is waiting on, when there is something to say.
+    pub busy_status: String,
     pub game_running: bool,
     pub world_builder_running: bool,
 
@@ -180,6 +184,7 @@ impl GenLauncherApp {
             dialog: None,
             pending_dialogs: Vec::new(),
             busy: false,
+            busy_status: String::new(),
             game_running: false,
             world_builder_running: false,
             options: None,
@@ -253,6 +258,61 @@ impl GenLauncherApp {
                     self.begin_download(&key);
                 }
             }
+
+            DialogId::DeleteArchives { files } => {
+                if confirmed {
+                    self.delete_archives(&files);
+                }
+            }
+        }
+    }
+
+    /// After a mod was installed from archives: say what happened and ask
+    /// whether the originals, now redundant, should go.
+    fn offer_to_delete_archives(
+        &mut self,
+        archives: Vec<std::path::PathBuf>,
+        report: &crate::game::mod_archive::InstallReport,
+    ) {
+        let mut message = i18n::tr("ArchiveAdded");
+        if report.skipped_files > 0 {
+            message.push(' ');
+            message.push_str(&i18n::trf(
+                "ArchiveSkipped",
+                &[
+                    &report.skipped_files.to_string(),
+                    &(report.skipped_bytes / 1_048_576).to_string(),
+                ],
+            ));
+        }
+
+        let names: Vec<String> =
+            archives.iter().map(|a| crate::util::fs::file_name_of(a)).collect();
+        message.push_str("\n\n");
+        message.push_str(&i18n::trf("ArchiveDeleteQuestion", &[&names.join("\n")]));
+
+        self.show_dialog(Dialog {
+            kind: DialogKind::Info,
+            cancel_label: i18n::tr("ArchiveKeep"),
+            ..Dialog::confirm(
+                DialogId::DeleteArchives { files: archives },
+                i18n::tr("ArchiveAddedTitle"),
+                message,
+                i18n::tr("Delete"),
+            )
+        });
+    }
+
+    fn delete_archives(&mut self, files: &[std::path::PathBuf]) {
+        let failures: Vec<String> = files
+            .iter()
+            .filter_map(|file| {
+                std::fs::remove_file(file).err().map(|e| format!("{}: {e}", file.display()))
+            })
+            .collect();
+
+        if !failures.is_empty() {
+            self.show_dialog(Dialog::error(i18n::tr("OperationAborted"), failures.join("\n")));
         }
     }
 
@@ -343,12 +403,17 @@ impl GenLauncherApp {
                 self.busy = false;
             }
 
-            Bg::ManualAddDone { error } => {
+            Bg::ManualAddStatus(status) => self.busy_status = status,
+
+            Bg::ManualAddDone { error, archives, report } => {
                 self.busy = false;
+                self.busy_status.clear();
                 self.store.refresh_local_modifications();
                 self.renumber_mods();
                 if let Some(error) = error {
                     self.show_dialog(Dialog::error(i18n::tr("OperationAborted"), error));
+                } else if !archives.is_empty() {
+                    self.offer_to_delete_archives(archives, &report);
                 }
             }
 

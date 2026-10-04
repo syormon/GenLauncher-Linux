@@ -129,6 +129,33 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
+      # build.rs embeds the icon and a version resource. A failure there would
+      # still produce a working .exe, just with the generic icon, so check the
+      # result rather than trusting the build.
+      - name: Check the executable's icon and version
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          EXE: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = (Resolve-Path $env:EXE).Path
+
+          Add-Type -Namespace Win32 -Name Shell -MemberDefinition @'
+          [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+          public static extern uint ExtractIconEx(string file, int index, IntPtr[] large, IntPtr[] small, uint count);
+          '@
+          # Index -1 asks for the number of icons rather than extracting one.
+          $icons = [Win32.Shell]::ExtractIconEx($path, -1, $null, $null, 0)
+          if ($icons -lt 1) { throw "no icon is embedded in $path" }
+
+          $info = (Get-Item $path).VersionInfo
+          if ($info.ProductVersion -ne $env:VERSION) {
+            throw "ProductVersion is '$($info.ProductVersion)', expected '$env:VERSION'"
+          }
+          "icons: $icons; $($info.ProductName) $($info.ProductVersion)"
+
       # The release ships the bare executable, renamed so the two platforms'
       # assets can sit side by side in one release.
       - name: Stage executable

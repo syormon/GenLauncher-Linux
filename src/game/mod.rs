@@ -1,6 +1,7 @@
 pub mod big;
 pub mod gentool;
 pub mod launcher;
+pub mod mod_archive;
 pub mod options;
 pub mod proton;
 pub mod steam;

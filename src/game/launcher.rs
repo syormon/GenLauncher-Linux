@@ -13,7 +13,7 @@ use crate::model::{ModVersion, ModificationType, ProtonSettings};
 use crate::util::fs as gfs;
 
 /// Loose files a modification may ship that must be hidden before launch.
-const CUSTOM_FILE_EXTENSIONS: &[&str] =
+pub(crate) const CUSTOM_FILE_EXTENSIONS: &[&str] =
     &["w3d", "dds", "tga", "ini", "scb", "wnd", "csf", "str"];
 
 /// Extensions whose checksum is worth verifying against the repository.

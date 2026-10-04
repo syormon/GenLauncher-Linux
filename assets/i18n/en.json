@@ -148,5 +148,12 @@
  "ProtonBuildHint": "the Proton Steam runs the game with",
  "ProtonEnv": "Environment variables:",
  "ProtonConfigure": "Open winecfg",
- "ProtonVirtualDesktop": "Run the game in a Wine virtual desktop (needed for the mouse to work on a second monitor)"
+ "ProtonVirtualDesktop": "Run the game in a Wine virtual desktop (needed for the mouse to work on a second monitor)",
+ "RarToolMissing": "{0} is a RAR archive. Unpacking those needs 7-Zip or UnRAR, and neither was found.\n\nInstall 7-Zip (https://www.7-zip.org) and try again, or extract the archive yourself and add its .big files, or re-pack it as a .zip.",
+ "ArchiveComparing": "Comparing with the game's files...",
+ "ArchiveAddedTitle": "Modification added",
+ "ArchiveAdded": "The modification was added.",
+ "ArchiveSkipped": "{0} files identical to the game's own were left out ({1} MB).",
+ "ArchiveDeleteQuestion": "Delete the original archive, now that it is installed?\n{0}",
+ "ArchiveKeep": "Keep"
 }

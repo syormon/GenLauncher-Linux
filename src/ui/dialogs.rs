@@ -252,6 +252,7 @@ pub fn show_manual_add(app: &mut GenLauncherApp, ctx: &Context) {
             app.runtime(),
             state.files.clone(),
             state.target_relative(),
+            app.session.game_mode,
             app.tx.clone(),
         );
     }

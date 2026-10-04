@@ -2,11 +2,13 @@
 
 This is a based off of [GenLauncher](https://github.com/p0ls3r/GenLauncher). Tested on Windows 10 and Ubuntu.
 
+![image](sample.png)
+
 # Why migrate this to Rust?
 1. The original is writen in `.NET Framework`, which generally isn't suppport on Linux
 2. I comtemplated migrated `.NET Framwork` to `.NET Core`, but `.NET Core` isn't support on BSD, which is a goal
 3. A Systems language is a better language for this kind of tool, as the code base dropped from ~100k loc to ~20k loc.
-4. I have limited time to support this and LLMs are better at rust
+4. I have limited time to support this and LLMs can provide more trustworthy outputs for rust.
 
 # Install
 
@@ -21,7 +23,8 @@ This is a based off of [GenLauncher](https://github.com/p0ls3r/GenLauncher). Tes
 ## Differences from the original
 
 * lock file rather than a mutex, so it works the same on Windows/Linux.
-* extraction attempts `7z`, `unar` or `unrar` if one is on PATH.
+* `.rar` extraction uses 7-Zip, `unrar` or `unar` if one is installed (on PATH, or in 7-Zip's or WinRAR's default folder on Windows). `.zip` and `.7z` need nothing.
+* **Add mod from files understands downloaded archives.** Pick the `.zip`/`.rar`/`.7z` as downloaded (e.g. from ModDB): the name and version are suggested from the file name, wrapper folders are stepped through, a full-game repack is reduced to the files the mod actually changes, and you are asked afterwards whether to delete the archive.
 * No self-update
 * No advertising card
 * **Modded executable.** `Use modded exe files` [default] now downloads the repository's `ModdedExe` and runs it.
@@ -46,6 +49,8 @@ With it off, `d3d8.dll` is moved aside for the run.
 ```bash
 cargo run --release
 ```
+
+> On Windows, `build.rs` generates the `.exe` icon from `assets/icon.png` and embeds it with the version from `Cargo.toml`.
 
 ## Tests
 
