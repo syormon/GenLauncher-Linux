@@ -12,22 +12,22 @@ use crate::ui::mod_row::{self, RowAction, RowContext};
 use crate::ui::theme;
 use crate::util::{self, fs as gfs};
 
-pub fn show(app: &mut GenLauncherApp, ctx: &Context) {
+pub fn show(app: &mut GenLauncherApp, ui: &mut egui::Ui) {
     let palette = app.palette;
 
     // The action column keeps a share of the width rather than a fixed size,
     // so the window can be resized without crowding the mod list.
-    let side_width = (ctx.screen_rect().width() * 0.29).clamp(240.0, 340.0);
+    let side_width = (ui.ctx().content_rect().width() * 0.29).clamp(240.0, 340.0);
 
-    egui::SidePanel::right("actions")
-        .exact_width(side_width)
+    egui::Panel::right("actions")
+        .exact_size(side_width)
         .frame(
             egui::Frame::NONE
                 .fill(palette.dark_background)
                 .inner_margin(egui::Margin::symmetric(18, 14)),
         )
         .resizable(false)
-        .show(ctx, |ui| side_panel(app, ui));
+        .show(ui, |ui| side_panel(app, ui));
 
     egui::CentralPanel::default()
         .frame(
@@ -35,7 +35,7 @@ pub fn show(app: &mut GenLauncherApp, ctx: &Context) {
                 .fill(surface(&palette))
                 .inner_margin(egui::Margin::symmetric(14, 10)),
         )
-        .show(ctx, |ui| {
+        .show(ui, |ui| {
             tab_strip(app, ui);
             ui.add_space(5.0);
             add_buttons(app, ui);
@@ -83,18 +83,25 @@ fn tab_strip(app: &mut GenLauncherApp, ui: &mut egui::Ui) {
                 } else {
                     app.palette.dark_background
                 };
-                if ui
-                    .add_sized(
-                        Vec2::new(available * weight, 26.0),
-                        egui::Button::new(RichText::new(label).size(13.0)).fill(fill),
-                    )
-                    .clicked()
-                {
+                if tab_button(ui, &label, available * weight, fill).clicked() {
                     app.switch_tab(tab);
                 }
             }
         });
     });
+}
+
+/// One tab, exactly `width` wide.
+///
+/// The label is cut short with an ellipsis rather than allowed to grow: a
+/// button wider than its slot widens the whole panel, and every card below
+/// then lays itself out past the side bar. Hovering shows the full label.
+fn tab_button(ui: &mut egui::Ui, label: &str, width: f32, fill: egui::Color32) -> egui::Response {
+    ui.add_sized(
+        Vec2::new(width, 26.0),
+        egui::Button::new(RichText::new(label).size(13.0)).fill(fill).truncate(),
+    )
+    .on_hover_text(label)
 }
 
 fn add_buttons(app: &mut GenLauncherApp, ui: &mut egui::Ui) {
@@ -656,5 +663,45 @@ pub fn apply_game_mode_constraints(app: &mut GenLauncherApp) {
     if app.session.game_mode == Game::Generals {
         app.store.data.modded_exe = false;
         app.store.data.camera_height = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lay one tab out headless in a slot `width` wide; return its real width.
+    fn tab_width(label: &str, width: f32) -> f32 {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 720.0));
+        let mut actual = 0.0;
+
+        // A few passes, as egui settles some sizes from the previous frame.
+        for _ in 0..3 {
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        actual = tab_button(ui, label, width, egui::Color32::BLACK).rect.width();
+                    });
+                });
+            });
+            // Nothing renders this; egui insists the font atlas is not just dropped.
+            output.drop_without_applying_deltas();
+        }
+        actual
+    }
+
+    #[test]
+    fn a_tab_keeps_its_width_however_long_the_mod_name_is() {
+        // "Patches for <mod>" carries the selected mod's name. A tab wider than
+        // its slot widens the whole panel, pushing every card under the side bar.
+        let short = tab_width("Patches for Contra", 200.0);
+        let long = tab_width(
+            "Patches for Generals Project Raptor War Commanders Extended Edition",
+            200.0,
+        );
+        assert!((short - 200.0).abs() < 0.5, "short tab is {short}px in a 200px slot");
+        assert!((long - 200.0).abs() < 0.5, "long tab is {long}px in a 200px slot");
     }
 }

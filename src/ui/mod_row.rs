@@ -84,28 +84,10 @@ pub fn mod_row(
             ui.set_width(ui.available_width());
 
             // -- header: name, latest version, version picker ---------------
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(name_text(modification, ctx.selected, palette).size(15.0));
-                    ui.label(
-                        RichText::new(latest_version_label(modification))
-                            .size(14.0)
-                            .color(if ctx.selected {
-                                palette.default_text
-                            } else {
-                                palette.inactive_border
-                            }),
-                    );
-                });
-
-                if ctx.selected {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if let Some(picked) = version_picker(ui, modification, &ctx) {
-                            action = picked;
-                        }
-                    });
-                }
-            });
+            let name = name_text(modification, ctx.selected, palette).size(15.0);
+            if let Some(picked) = header(ui, modification, &ctx, name, 14.0) {
+                action = picked;
+            }
 
             // -- artwork ----------------------------------------------------
             if let Some(texture) =
@@ -235,28 +217,10 @@ pub fn addon_row(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
 
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(name_text(modification, ctx.selected, palette).size(13.0).strong());
-                    ui.label(
-                        RichText::new(latest_version_label(modification))
-                            .size(13.0)
-                            .color(if ctx.selected {
-                                palette.default_text
-                            } else {
-                                palette.inactive_border
-                            }),
-                    );
-                });
-
-                if ctx.selected {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if let Some(picked) = version_picker(ui, modification, &ctx) {
-                            action = picked;
-                        }
-                    });
-                }
-            });
+            let name = name_text(modification, ctx.selected, palette).size(13.0).strong();
+            if let Some(picked) = header(ui, modification, &ctx, name, 13.0) {
+                action = picked;
+            }
 
             let (fraction, message, active) = match ctx.download {
                 Some(state) => (state.fraction, state.message.clone(), true),
@@ -315,6 +279,41 @@ pub fn addon_row(
     RowOutcome { action, response }
 }
 
+/// The top of a card: the name and latest version on the left, and for the
+/// selected card the version picker on the right.
+fn header(
+    ui: &mut Ui,
+    modification: &GameModification,
+    ctx: &RowContext<'_>,
+    name: RichText,
+    detail_size: f32,
+) -> Option<RowAction> {
+    let palette = ctx.palette;
+    let mut action = None;
+
+    let detail = RichText::new(latest_version_label(modification))
+        .size(detail_size)
+        .color(if ctx.selected { palette.default_text } else { palette.inactive_border });
+
+    ui.horizontal(|ui| {
+        // Laid out from the right, so the picker claims its width first and
+        // the text gets what is left. The other way round, a long name took
+        // the whole row and the picker was drawn on top of it.
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ctx.selected {
+                action = version_picker(ui, modification, ctx);
+            }
+
+            ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
+                ui.add(egui::Label::new(name).wrap());
+                ui.add(egui::Label::new(detail).wrap());
+            });
+        });
+    });
+
+    action
+}
+
 fn name_text(modification: &GameModification, selected: bool, palette: &Palette) -> RichText {
     let text = RichText::new(modification.name());
     if selected {
@@ -331,6 +330,8 @@ fn latest_version_label(modification: &GameModification) -> String {
         .unwrap_or_default();
     format!("{}{version}", i18n::tr("LatestVersion"))
 }
+
+const VERSION_PICKER_WIDTH: f32 = 190.0;
 
 /// Drop-down of installed versions, with a Delete button beside each one.
 fn version_picker(
@@ -350,9 +351,16 @@ fn version_picker(
     let downloading = ctx.download.is_some();
 
     ui.add_enabled_ui(ctx.enabled && !downloading, |ui| {
+        // A fixed width. egui truncates a combo box to the space available,
+        // not to its own `width`, so the space is what has to be capped: left
+        // alone, a long version string widens the picker across the card. The
+        // drop-down list still shows each version in full.
+        ui.set_max_width(VERSION_PICKER_WIDTH.min(ui.available_width()));
+
         egui::ComboBox::from_id_salt(("versions", modification.name()))
             .selected_text(RichText::new(&current).size(13.0))
-            .width(190.0)
+            .width(ui.available_width())
+            .truncate()
             .show_ui(ui, |ui| {
                 for version in &ctx.installed_versions {
                     ui.horizontal(|ui| {
@@ -488,5 +496,143 @@ fn artwork(
         }
 
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Game;
+    use crate::model::{ModVersion, ReposVersion};
+
+    /// Where a selected card's header drew its parts.
+    struct Drawn {
+        card: egui::Rect,
+        /// The mod name, all of its lines.
+        name: egui::Rect,
+        /// The version shown in the picker.
+        picker_text: egui::Rect,
+        /// Everything painted.
+        all: egui::Rect,
+    }
+
+    /// Every piece of text in `shape`, with where it was painted.
+    fn texts(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                out.push((text.galley.text().to_owned(), text.visual_bounding_rect()));
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| texts(s, out)),
+            _ => {}
+        }
+    }
+
+    /// Lay a selected card's header out, headless, in a card `card_width` wide.
+    fn draw_header(name: &str, version: &str, card_width: f32) -> Drawn {
+        let palette = Palette::for_game(Game::ZeroHour);
+        let installed = ModVersion {
+            info: ReposVersion {
+                name: name.to_owned(),
+                version: version.to_owned(),
+                modification_type: ModificationType::Mod,
+                ..Default::default()
+            },
+            is_selected: true,
+            installed: true,
+        };
+        let modification = GameModification::new(&installed);
+        let row = RowContext {
+            palette: &palette,
+            selected: true,
+            download: None,
+            installed_versions: vec![version.to_owned()],
+            selected_version: Some(version.to_owned()),
+            connected: true,
+            enabled: true,
+            thank_you: false,
+        };
+
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 720.0));
+        let mut card = egui::Rect::NOTHING;
+        let mut drawn = Vec::new();
+        let mut all = egui::Rect::NOTHING;
+
+        // A few passes, as egui settles some sizes from the previous frame.
+        for _ in 0..3 {
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(card_width, 100.0),
+                        Layout::top_down(Align::LEFT),
+                        |ui| {
+                            // What `mod_row` does before drawing the header.
+                            ui.set_width(card_width);
+                            card = ui.max_rect();
+                            let name = name_text(&modification, true, &palette).size(15.0);
+                            header(ui, &modification, &row, name, 14.0);
+                        },
+                    );
+                });
+            });
+
+            drawn.clear();
+            output.shapes.iter().for_each(|clipped| texts(&clipped.shape, &mut drawn));
+            // Apart from the panel's own background, which fills the screen.
+            all = output
+                .shapes
+                .iter()
+                .map(|clipped| clipped.shape.visual_bounding_rect())
+                .filter(|rect| rect.is_positive() && rect.width() < screen.width() - 1.0)
+                .fold(egui::Rect::NOTHING, |all, rect| all.union(rect));
+            // Nothing renders this; egui insists the font atlas is not just dropped.
+            output.drop_without_applying_deltas();
+        }
+
+        let find = |wanted: &str| {
+            drawn
+                .iter()
+                .find(|(text, _)| text == wanted)
+                .unwrap_or_else(|| panic!("{wanted:?} was not drawn"))
+                .1
+        };
+        Drawn { card, name: find(name), picker_text: find(version), all }
+    }
+
+    const LONG_NAME: &str = "Generals Project Raptor War Commanders Extended Edition";
+
+    #[test]
+    fn a_long_name_wraps_instead_of_running_under_the_version_picker() {
+        // The card is this wide when the window is at its minimum size.
+        for width in [300.0, 432.0, 520.0, 662.0] {
+            let drawn = draw_header(LONG_NAME, "9.1.27 ENG Voice", width);
+            assert!(
+                drawn.name.right() <= drawn.picker_text.left(),
+                "in a {width}px card the name ends at {} but the picker's text starts at {}",
+                drawn.name.right(),
+                drawn.picker_text.left(),
+            );
+        }
+    }
+
+    #[test]
+    fn the_header_stays_inside_the_card() {
+        for (name, version) in [
+            ("Contra", "009 Final"),
+            (LONG_NAME, "9.1.27 ENG Voice"),
+            ("Rise of the Reds", "1.87 Public Build 2.0 Hotfix 3 Community Edition"),
+        ] {
+            for width in [300.0, 432.0, 662.0] {
+                let drawn = draw_header(name, version, width);
+                assert!(
+                    drawn.all.right() <= drawn.card.right() + 0.5
+                        && drawn.all.left() >= drawn.card.left() - 0.5,
+                    "{name:?} / {version:?} in a {width}px card drew {:?}, outside {:?}",
+                    drawn.all.x_range(),
+                    drawn.card.x_range(),
+                );
+            }
+        }
     }
 }

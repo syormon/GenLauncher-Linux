@@ -231,33 +231,8 @@ impl Launcher {
     }
 }
 
-impl eframe::App for Launcher {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        let _ = frame;
-        self.app.pump_messages(ctx);
-
-        match &self.app.phase {
-            Phase::Initializing { status } => {
-                let status = status.clone();
-                ui::dialogs::show_splash(ctx, &self.app, &status);
-            }
-
-            Phase::Ready => {
-                if !self.startup_done {
-                    self.startup_done = true;
-                    ui::main_view::apply_game_mode_constraints(&mut self.app);
-                }
-
-                ui::main_view::show(&mut self.app, ctx);
-
-                // Modals stack on top, innermost last.
-                ui::options_view::show(&mut self.app, ctx);
-                ui::dialogs::show_add_mod(&mut self.app, ctx);
-                ui::dialogs::show_manual_add(&mut self.app, ctx);
-                ui::dialogs::show_dialog(&mut self.app, ctx);
-            }
-        }
-
+impl Launcher {
+    fn handle_closing(&mut self, ctx: &egui::Context) {
         // Closing the window while a game runs would unlink its mod files.
         if ctx.input(|i| i.viewport().close_requested()) && self.app.launch_in_progress() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -267,6 +242,48 @@ impl eframe::App for Launcher {
         if self.app.quit_requested() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+    }
+}
+
+impl eframe::App for Launcher {
+    /// Runs before every frame, and on its own whenever a repaint is asked for
+    /// while the window is minimised or covered: eframe draws nothing then,
+    /// which is exactly the state the launcher is in while the game runs. So
+    /// everything that must keep working unseen lives here, above all the
+    /// message that says the game has exited and the window should come back.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.app.pump_messages(ctx);
+        self.handle_closing(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        match &self.app.phase {
+            Phase::Initializing { status } => {
+                let status = status.clone();
+                ui::dialogs::show_splash(ui, &self.app, &status);
+            }
+
+            Phase::Ready => {
+                if !self.startup_done {
+                    self.startup_done = true;
+                    ui::main_view::apply_game_mode_constraints(&mut self.app);
+                }
+
+                ui::main_view::show(&mut self.app, ui);
+
+                // Modals stack on top, innermost last.
+                let ctx = ui.ctx().clone();
+                ui::options_view::show(&mut self.app, &ctx);
+                ui::dialogs::show_add_mod(&mut self.app, &ctx);
+                ui::dialogs::show_manual_add(&mut self.app, &ctx);
+                ui::dialogs::show_dialog(&mut self.app, &ctx);
+            }
+        }
+
+        // Again here, so the Exit button closes the window on the frame it is
+        // clicked rather than on the next one.
+        let ctx = ui.ctx().clone();
+        self.handle_closing(&ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

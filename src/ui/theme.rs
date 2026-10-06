@@ -12,7 +12,7 @@ pub const MOD_IMAGE_ASPECT: f32 = 5.0;
 pub const MOD_IMAGE_MAX_HEIGHT: f32 = 76.0;
 
 pub fn apply(ctx: &egui::Context, palette: &Palette) {
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     let v = &mut style.visuals;
 
     v.dark_mode = true;
@@ -60,7 +60,7 @@ pub fn apply(ctx: &egui::Context, palette: &Palette) {
     style.spacing.item_spacing = Vec2::new(6.0, 6.0);
     style.spacing.button_padding = Vec2::new(8.0, 4.0);
 
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 /// The blinking accent the WPF build used to draw attention to an update.

@@ -150,7 +150,22 @@ pub struct GenLauncherApp {
 
 impl GenLauncherApp {
     pub fn new(cc: &eframe::CreationContext<'_>, game: Game) -> Self {
-        let (tx, rx) = channel();
+        // Workers send on `tx` and know nothing about egui. Each message is
+        // passed on with a repaint request, because egui only runs when asked:
+        // without one, a message would sit unread until the next mouse move,
+        // or indefinitely while the window is minimised behind the game.
+        let (tx, from_workers) = channel::<Bg>();
+        let (to_ui, rx) = channel::<Bg>();
+        let waker = cc.egui_ctx.clone();
+        std::thread::spawn(move || {
+            while let Ok(message) = from_workers.recv() {
+                if to_ui.send(message).is_err() {
+                    break;
+                }
+                waker.request_repaint();
+            }
+        });
+
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()

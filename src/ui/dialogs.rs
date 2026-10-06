@@ -263,10 +263,10 @@ pub fn show_manual_add(app: &mut GenLauncherApp, ctx: &Context) {
 }
 
 /// Splash screen shown while start-up runs.
-pub fn show_splash(ctx: &Context, app: &GenLauncherApp, status: &str) {
+pub fn show_splash(ui: &mut egui::Ui, app: &GenLauncherApp, status: &str) {
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(app.palette.dark_background))
-        .show(ctx, |ui| {
+        .show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(ui.available_height() * 0.35);
                 ui.label(
@@ -280,7 +280,7 @@ pub fn show_splash(ctx: &Context, app: &GenLauncherApp, status: &str) {
         });
 
     // Keep animating while we wait.
-    ctx.request_repaint_after(std::time::Duration::from_millis(80));
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(80));
 }
 
 /// Open a native file picker for archives the user wants to install by hand.
