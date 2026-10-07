@@ -1,4 +1,5 @@
 pub mod big;
+pub mod custom_engine;
 pub mod gentool;
 pub mod launcher;
 pub mod mod_archive;

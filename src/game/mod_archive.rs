@@ -33,13 +33,41 @@ impl InstallReport {
     }
 }
 
+/// The steps of an install, in order, for the progress bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Unpacking the archive: nearly all of the time for a large mod.
+    Unpacking,
+    /// Checking which unpacked files the game already has.
+    Comparing,
+    /// Moving the result into the mod store.
+    Finishing,
+}
+
+impl Stage {
+    pub const COUNT: usize = 3;
+
+    pub fn number(self) -> usize {
+        self as usize + 1
+    }
+
+    pub fn label(self) -> String {
+        crate::i18n::tr(match self {
+            Stage::Unpacking => "Unpacking",
+            Stage::Comparing => "ArchiveComparing",
+            Stage::Finishing => "ArchiveFinishing",
+        })
+    }
+}
+
 /// Unpack `archive` and install what it holds into `target`, a version folder
-/// in the mod store. `status` receives one line per stage.
+/// in the mod store. `progress` is told which stage is running and how far
+/// through it is, or `None` when that cannot be known.
 pub fn install(
     archive_path: &Path,
     target: &Path,
     game: Game,
-    status: &dyn Fn(&str),
+    progress: &dyn Fn(Stage, Option<f32>),
 ) -> Result<InstallReport> {
     // Staged beside the target under the suffix that start-up cleans away,
     // so an interrupted install never leaves a half-written mod behind.
@@ -50,9 +78,10 @@ pub fn install(
     ));
     let _ = std::fs::remove_dir_all(&staging);
 
-    status(&crate::i18n::tr("Unpacking"));
     let result = (|| {
-        archive::extract(archive_path, &staging, true)?;
+        archive::extract_with_progress(archive_path, &staging, true, &|fraction| {
+            progress(Stage::Unpacking, fraction);
+        })?;
 
         let root = find_game_root(&staging, game);
         if !contains_game_root(&root, 0) {
@@ -63,10 +92,12 @@ pub fn install(
             );
         }
 
-        status(&crate::i18n::tr("ArchiveComparing"));
-        let report = drop_files_the_game_already_has(&root, game);
+        progress(Stage::Comparing, None);
+        let report = drop_files_the_game_already_has(&root, game, &|fraction| {
+            progress(Stage::Comparing, Some(fraction));
+        });
 
-        status(&crate::i18n::tr("UnpackingPreparing"));
+        progress(Stage::Finishing, None);
         merge_into(&root, target)?;
         Ok(report)
     })();
@@ -278,10 +309,17 @@ fn game_score(candidate: &Path, game: Game) -> i64 {
 /// launch the launcher hides every non-stock `.big` and every loose file with
 /// a mod extension, so an identical copy of one of *those* would vanish along
 /// with the game's and must stay in the mod.
-fn drop_files_the_game_already_has(mod_root: &Path, game: Game) -> InstallReport {
+fn drop_files_the_game_already_has(
+    mod_root: &Path,
+    game: Game,
+    progress: &dyn Fn(f32),
+) -> InstallReport {
     let stock = stock_files::for_game(game);
     let mut report = InstallReport::default();
 
+    // First the cheap checks, to find the files worth reading at all. Then
+    // the reading, which is where the time goes and what progress measures.
+    let mut candidates: Vec<(PathBuf, PathBuf, u64)> = Vec::new();
     gfs::visit_files(mod_root, &mut |file| {
         let Ok(rel) = file.strip_prefix(mod_root) else { return };
         let name = stock_name(file);
@@ -297,24 +335,37 @@ fn drop_files_the_game_already_has(mod_root: &Path, game: Game) -> InstallReport
 
         let in_game = config::game_path(rel.with_file_name(&name));
         // Only a real file counts: a link would be another mod's, not the game's.
-        let is_plain_file =
-            std::fs::symlink_metadata(&in_game).map(|m| m.file_type().is_file()).unwrap_or(false);
-        if !is_plain_file || !same_contents(file, &in_game) {
-            return;
+        let Ok(game_meta) = std::fs::symlink_metadata(&in_game) else { return };
+        let Ok(mod_meta) = std::fs::metadata(file) else { return };
+        if game_meta.file_type().is_file() && game_meta.len() == mod_meta.len() {
+            candidates.push((file.to_path_buf(), in_game, mod_meta.len()));
         }
+    });
 
-        let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
-        if std::fs::remove_file(file).is_ok() {
+    let total: u64 = candidates.iter().map(|(_, _, size)| size).sum();
+    let mut done = 0u64;
+    for (file, in_game, size) in candidates {
+        let identical = same_contents(&file, &in_game, &mut |read| {
+            if total > 0 {
+                progress(((done + read) as f64 / total as f64).min(1.0) as f32);
+            }
+        });
+        done += size;
+
+        if identical && std::fs::remove_file(&file).is_ok() {
             report.skipped_files += 1;
             report.skipped_bytes += size;
         }
-    });
+    }
+    progress(1.0);
 
     remove_empty_dirs(mod_root);
     report
 }
 
-fn same_contents(a: &Path, b: &Path) -> bool {
+/// True when the two files hold the same bytes. `on_read` is told how many
+/// bytes of them have been compared so far.
+fn same_contents(a: &Path, b: &Path, on_read: &mut dyn FnMut(u64)) -> bool {
     let (Ok(meta_a), Ok(meta_b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
         return false;
     };
@@ -327,6 +378,7 @@ fn same_contents(a: &Path, b: &Path) -> bool {
     };
     let mut buf_a = vec![0u8; 1 << 20];
     let mut buf_b = vec![0u8; 1 << 20];
+    let mut compared = 0u64;
     loop {
         let Ok(read) = file_a.read(&mut buf_a) else { return false };
         if read == 0 {
@@ -335,6 +387,8 @@ fn same_contents(a: &Path, b: &Path) -> bool {
         if file_b.read_exact(&mut buf_b[..read]).is_err() || buf_a[..read] != buf_b[..read] {
             return false;
         }
+        compared += read as u64;
+        on_read(compared);
     }
 }
 
@@ -413,8 +467,15 @@ mod tests {
         println!("guessed name: {name:?}, version: {version:?}");
 
         let started = std::time::Instant::now();
-        let report = install(&archive_path, &out, game, &|line| {
-            println!("status at {:>4.0?}: {line}", started.elapsed())
+        // One line per stage and per ten percent, so the progress is visible.
+        let last = std::cell::Cell::new((0usize, -1i32));
+        let report = install(&archive_path, &out, game, &|stage, fraction| {
+            let tenth = fraction.map_or(-1, |f| (f * 10.0) as i32);
+            if last.get() != (stage.number(), tenth) {
+                last.set((stage.number(), tenth));
+                let shown = fraction.map_or("...".to_owned(), |f| format!("{:.0}%", f * 100.0));
+                println!("progress at {:>4.0?}: {}/{} {} {shown}", started.elapsed(), stage.number(), Stage::COUNT, stage.label());
+            }
         })
         .expect("install failed");
 
@@ -539,10 +600,16 @@ mod tests {
         fs::write(dir.join("c"), b"same_bytes").unwrap();
         fs::write(dir.join("d"), b"longer than the others").unwrap();
 
-        assert!(same_contents(&dir.join("a"), &dir.join("b")));
-        assert!(!same_contents(&dir.join("a"), &dir.join("c")));
-        assert!(!same_contents(&dir.join("a"), &dir.join("d")));
-        assert!(!same_contents(&dir.join("a"), &dir.join("missing")));
+        let same = |a: &str, b: &str| same_contents(&dir.join(a), &dir.join(b), &mut |_| {});
+        assert!(same("a", "b"));
+        assert!(!same("a", "c"));
+        assert!(!same("a", "d"));
+        assert!(!same("a", "missing"));
+
+        // The caller hears how much has been compared.
+        let mut heard = 0;
+        assert!(same_contents(&dir.join("a"), &dir.join("b"), &mut |read| heard = read));
+        assert_eq!(heard, 10);
         let _ = fs::remove_dir_all(&dir);
     }
 

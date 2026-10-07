@@ -5,11 +5,12 @@ use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use crate::config::{self, Game, SessionInfo};
+use crate::game::custom_engine::{self, CustomEngine};
 use crate::game::options::GameOptions;
 use crate::game::gentool;
 use crate::i18n;
 use crate::model::colors::Palette;
-use crate::model::{compare_versions, ModVersion, ModificationType};
+use crate::model::{compare_versions, EngineChoice, GameModification, ModVersion, ModificationType};
 use crate::net::download::{Cancel, DownloadEvent, ModKey};
 use crate::state::Store;
 use crate::tasks::{self, Bg};
@@ -43,6 +44,17 @@ pub enum DialogId {
     DownloadDeprecated { key: ModKey },
     /// Delete the archives a mod was just installed from.
     DeleteArchives { files: Vec<std::path::PathBuf> },
+    /// The selected mod ships its own game engine: which one should run?
+    ChooseEngine,
+}
+
+/// Which button of a dialog was pressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    Confirm,
+    /// The second choice of a three-way dialog.
+    Alternate,
+    Cancel,
 }
 
 pub struct Dialog {
@@ -52,6 +64,8 @@ pub struct Dialog {
     pub message: String,
     pub confirm_label: String,
     pub cancel_label: String,
+    /// A second way to go ahead, between confirm and cancel.
+    pub alternate_label: Option<String>,
     /// `false` for a plain acknowledgement with a single OK button.
     pub has_choice: bool,
 }
@@ -65,6 +79,7 @@ impl Dialog {
             message: message.into(),
             confirm_label: i18n::tr("Ok"),
             cancel_label: i18n::tr("Cancel"),
+            alternate_label: None,
             has_choice: false,
         }
     }
@@ -86,9 +101,18 @@ impl Dialog {
             message: message.into(),
             confirm_label: confirm_label.into(),
             cancel_label: i18n::tr("Cancel"),
+            alternate_label: None,
             has_choice: true,
         }
     }
+}
+
+/// What the "add mod from files" progress bar shows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddProgress {
+    pub label: String,
+    /// `None` while the step cannot say how far along it is.
+    pub fraction: Option<f32>,
 }
 
 /// Live state of one modification download.
@@ -133,14 +157,18 @@ pub struct GenLauncherApp {
     pending_dialogs: Vec<Dialog>,
 
     pub busy: bool,
-    /// What the busy spinner is waiting on, when there is something to say.
-    pub busy_status: String,
+    /// Progress of an "add mod from files" install, while one is running.
+    pub add_progress: Option<AddProgress>,
     pub game_running: bool,
     pub world_builder_running: bool,
 
     pub options: Option<ui::options_view::OptionsState>,
     pub add_mod: Option<ui::dialogs::AddModState>,
     pub manual_add: Option<ui::dialogs::ManualAddState>,
+
+    /// What each mod version's folder holds by way of its own game engine,
+    /// worked out at most once per run: it means reading all of a mod's INI.
+    engine_cache: HashMap<std::path::PathBuf, Option<CustomEngine>>,
 
     /// Mod whose support button should pulse after a good session.
     pub thank_you_for: Option<ModKey>,
@@ -199,12 +227,13 @@ impl GenLauncherApp {
             dialog: None,
             pending_dialogs: Vec::new(),
             busy: false,
-            busy_status: String::new(),
+            add_progress: None,
             game_running: false,
             world_builder_running: false,
             options: None,
             add_mod: None,
             manual_add: None,
+            engine_cache: HashMap::new(),
             thank_you_for: None,
             quit_requested: false,
         }
@@ -225,9 +254,10 @@ impl GenLauncherApp {
     }
 
     /// Act on the user's answer to the dialog currently on screen.
-    pub fn answer_dialog(&mut self, confirmed: bool) {
+    pub fn answer_dialog(&mut self, answer: Answer) {
         let Some(dialog) = self.dialog.take() else { return };
         self.dialog = self.pending_dialogs.pop();
+        let confirmed = answer == Answer::Confirm;
 
         match dialog.id {
             DialogId::Acknowledge => {}
@@ -248,8 +278,21 @@ impl GenLauncherApp {
 
             DialogId::ConfirmDeprecated { world_builder } => {
                 if confirmed {
-                    self.advance_launch(world_builder, LaunchStep::CheckIntegrity);
+                    self.advance_launch(world_builder, LaunchStep::CheckEngine);
                 }
+            }
+
+            DialogId::ChooseEngine => {
+                let choice = match answer {
+                    Answer::Confirm => EngineChoice::Own,
+                    Answer::Alternate => EngineChoice::Standard,
+                    // Nothing is remembered, so the next launch asks again.
+                    Answer::Cancel => return,
+                };
+                if let Some(name) = self.store.selected_mod_name() {
+                    self.set_engine_choice(&name, choice);
+                }
+                self.advance_launch(false, LaunchStep::CheckIntegrity);
             }
 
             DialogId::ConfirmIntegrity { world_builder } => {
@@ -289,9 +332,10 @@ impl GenLauncherApp {
         archives: Vec<std::path::PathBuf>,
         report: &crate::game::mod_archive::InstallReport,
     ) {
-        let mut message = i18n::tr("ArchiveAdded");
+        // The title already says the mod was added; the body only adds what
+        // is new: anything left out, and the question.
+        let mut message = String::new();
         if report.skipped_files > 0 {
-            message.push(' ');
             message.push_str(&i18n::trf(
                 "ArchiveSkipped",
                 &[
@@ -299,11 +343,11 @@ impl GenLauncherApp {
                     &(report.skipped_bytes / 1_048_576).to_string(),
                 ],
             ));
+            message.push_str("\n\n");
         }
 
         let names: Vec<String> =
             archives.iter().map(|a| crate::util::fs::file_name_of(a)).collect();
-        message.push_str("\n\n");
         message.push_str(&i18n::trf("ArchiveDeleteQuestion", &[&names.join("\n")]));
 
         self.show_dialog(Dialog {
@@ -418,11 +462,13 @@ impl GenLauncherApp {
                 self.busy = false;
             }
 
-            Bg::ManualAddStatus(status) => self.busy_status = status,
+            Bg::ManualAddProgress { label, fraction } => {
+                self.add_progress = Some(AddProgress { label, fraction });
+            }
 
             Bg::ManualAddDone { error, archives, report } => {
                 self.busy = false;
-                self.busy_status.clear();
+                self.add_progress = None;
                 self.store.refresh_local_modifications();
                 self.renumber_mods();
                 if let Some(error) = error {
@@ -831,6 +877,17 @@ impl GenLauncherApp {
                     ));
                     return;
                 }
+                self.advance_launch(world_builder, LaunchStep::CheckEngine);
+            }
+
+            LaunchStep::CheckEngine => {
+                // World Builder is the game's own tool; this is about the game.
+                if !world_builder {
+                    if let Some(question) = self.engine_question() {
+                        self.show_dialog(question);
+                        return;
+                    }
+                }
                 self.advance_launch(world_builder, LaunchStep::CheckIntegrity);
             }
 
@@ -957,7 +1014,13 @@ impl GenLauncherApp {
             return;
         }
 
-        let modded_exe = if world_builder { None } else { self.modded_exe_for(&versions) };
+        // A mod's own engine takes the place of the launcher's modded one.
+        let custom_engine = if world_builder { None } else { self.custom_engine_for_launch() };
+        let modded_exe = if world_builder || custom_engine.is_some() {
+            None
+        } else {
+            self.modded_exe_for(&versions)
+        };
 
         self.busy = true;
         if world_builder {
@@ -982,11 +1045,145 @@ impl GenLauncherApp {
                 use_vulkan: self.store.data.use_vulkan,
                 gentool_auto_update: self.store.data.auto_update_gentool,
                 modded_exe,
+                custom_engine,
                 vulkan: self.store.repos.vulkan.clone(),
                 proton: self.store.data.proton.clone(),
             },
             self.tx.clone(),
         );
+    }
+
+    // -- a mod's own game engine --------------------------------------------
+
+    /// The engines the launcher would otherwise run: the game's own files and
+    /// the repository's modded executable. A mod's engine is "custom" only if
+    /// it differs from all of these.
+    fn known_engines(&self) -> Vec<std::path::PathBuf> {
+        let mut known = vec![config::game_path("generals.exe"), config::game_path("game.dat")];
+        known.extend(
+            self.store
+                .data
+                .exes
+                .iter()
+                .filter(|m| m.name().eq_ignore_ascii_case(config::MODDED_EXE_NAME))
+                .flat_map(|m| m.versions.iter())
+                .map(|v| v.folder_path().join(&v.info.executable_file_name)),
+        );
+        known
+    }
+
+    /// True when the user picked a replacement game executable on the Exes
+    /// tab. That is already an explicit choice of engine; do not second-guess it.
+    fn game_executable_replaced(&self) -> bool {
+        self.store
+            .active_versions()
+            .iter()
+            .any(|v| v.kind() == ModificationType::Executable && v.info.replaces_original_game_file)
+    }
+
+    fn detected_engine(&mut self, version: &ModVersion) -> Option<CustomEngine> {
+        let folder = version.folder_path();
+        if !self.engine_cache.contains_key(&folder) {
+            let found = custom_engine::detect(&folder, &self.known_engines());
+            if let Some(engine) = &found {
+                log::info!(
+                    "{} {} ships its own engine {} (evidence: {:?})",
+                    version.name(),
+                    version.version(),
+                    engine.file,
+                    engine.evidence
+                );
+            }
+            self.engine_cache.insert(folder.clone(), found);
+        }
+        self.engine_cache.get(&folder).cloned().flatten()
+    }
+
+    /// The question to put before launching, if the selected mod ships its
+    /// own engine and the user has not said which one to use.
+    fn engine_question(&mut self) -> Option<Dialog> {
+        let version = self.store.selected_mod_version()?.clone();
+        if !version.engine.is_ask() || self.game_executable_replaced() {
+            return None;
+        }
+        let engine = self.detected_engine(&version)?;
+
+        let mut message = i18n::trf("EngineDetected", &[version.name(), &engine.file]);
+        message.push_str("\n\n");
+        if engine.evidence.is_empty() {
+            message.push_str(&i18n::tr("EngineNoEvidence"));
+        } else {
+            const SHOWN: usize = 5;
+            let mut names = engine.evidence.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+            if engine.evidence.len() > SHOWN {
+                names.push_str(", ...");
+            }
+            message.push_str(&i18n::trf(
+                "EngineEvidence",
+                &[&engine.evidence.len().to_string(), &names],
+            ));
+        }
+        message.push_str("\n\n");
+        message.push_str(&i18n::tr("EngineWarning"));
+        message.push_str("\n\n");
+        message.push_str(&i18n::tr("EngineRemembered"));
+
+        Some(Dialog {
+            alternate_label: Some(i18n::tr("EngineUseStandard")),
+            cancel_label: i18n::tr("EngineDoNotLaunch"),
+            ..Dialog::confirm(
+                DialogId::ChooseEngine,
+                i18n::tr("EngineTitle"),
+                message,
+                i18n::tr("EngineUseOwn"),
+            )
+        })
+    }
+
+    /// The engine file to start the selected mod with, when the user chose
+    /// the mod's own and it is still there.
+    fn custom_engine_for_launch(&self) -> Option<String> {
+        let version = self.store.selected_mod_version()?;
+        if version.engine != EngineChoice::Own || self.game_executable_replaced() {
+            return None;
+        }
+        let found = custom_engine::find(&version.folder_path(), &self.known_engines());
+        if found.is_none() {
+            log::warn!(
+                "{} is set to use its own engine, but none is in its folder; using the standard one",
+                version.name()
+            );
+        }
+        found
+    }
+
+    /// Remember which engine to start a mod with. Applies to the version in
+    /// use, since the engine is a file of that version.
+    pub fn set_engine_choice(&mut self, name: &str, choice: EngineChoice) {
+        let Some(modification) = self.store.modification_mut(ModificationType::Mod, name) else {
+            return;
+        };
+        if let Some(version) = modification.versions.iter_mut().find(|v| v.is_selected) {
+            version.engine = choice;
+        }
+        // The aggregate record merges its versions' fields; keep it in step
+        // so a later merge does not bring an old answer back.
+        modification.latest.engine = choice;
+        self.store.save();
+    }
+
+    /// What a mod card's menu should offer about the engine: the stored
+    /// choice, or `Ask` once a custom engine has been seen. `None` hides the
+    /// entry, which is the case for nearly every mod.
+    pub fn engine_menu_state(&self, modification: &GameModification) -> Option<EngineChoice> {
+        let version = modification.versions.iter().find(|v| v.is_selected)?;
+        if !version.engine.is_ask() {
+            return Some(version.engine);
+        }
+        self.engine_cache
+            .get(&version.folder_path())
+            .is_some_and(Option::is_some)
+            .then_some(EngineChoice::Ask)
     }
 
     /// The repository's modded executable, when "Use modded exe files" is on
@@ -1150,6 +1347,7 @@ enum LaunchStep {
     FirstRun,
     CheckUpdates,
     CheckDeprecated,
+    CheckEngine,
     CheckIntegrity,
 }
 

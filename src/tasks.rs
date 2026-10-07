@@ -31,8 +31,9 @@ pub enum Bg {
     ModAdded { version: Box<ReposVersion>, extras: Vec<ReposVersion> },
     /// Patches and addons for the base game arrived.
     OriginalGameExtras(Vec<ReposVersion>),
-    /// One line of progress while files are being added by hand.
-    ManualAddStatus(String),
+    /// Progress while files are being added by hand: what is happening, and
+    /// how far through it is when that can be known.
+    ManualAddProgress { label: String, fraction: Option<f32> },
     /// Files were unpacked into the mod store by hand; rescan is needed.
     /// `archives` are the archives that were installed, so the user can be
     /// offered their deletion; it is empty when the install failed.
@@ -535,6 +536,9 @@ pub struct LaunchRequest {
     /// The repository's modded game executable, to download if needed and run
     /// in place of the stock one ("Use modded exe files").
     pub modded_exe: Option<ModVersion>,
+    /// The selected mod's own game engine (a file in its folder), when the
+    /// user chose to run it instead of the standard one.
+    pub custom_engine: Option<String>,
     /// Set when the repository advertises a Vulkan layer, so the launch can
     /// refresh it before starting the game.
     pub vulkan: Option<VulkanData>,
@@ -582,6 +586,7 @@ fn run_launch(request: LaunchRequest, tx: Sender<Bg>) {
         use_vulkan,
         gentool_auto_update,
         modded_exe,
+        custom_engine,
         vulkan,
         proton,
     } = request;
@@ -626,6 +631,30 @@ fn run_launch(request: LaunchRequest, tx: Sender<Bg>) {
         false,
     );
 
+    // The mod's own engine goes in last, over the game's. Failing here must
+    // stop the launch: the user asked for this engine, and quietly starting
+    // the standard one would just reproduce the crash they are avoiding.
+    let mut engine_exe = None;
+    if let Some(file) = custom_engine.filter(|_| !world_builder) {
+        let linked = versions
+            .iter()
+            .find(|v| v.kind() == ModificationType::Mod)
+            .ok_or_else(|| anyhow::anyhow!("no mod is selected"))
+            .and_then(|mod_version| launcher::link_custom_engine(mod_version, &file));
+        match linked {
+            Ok(exe) => engine_exe = Some(exe),
+            Err(e) => {
+                launcher::restore_game_folder();
+                let _ = tx.send(Bg::GameFinished {
+                    world_builder,
+                    played_long_enough: false,
+                    error: Some(format!("{e:#}")),
+                });
+                return;
+            }
+        }
+    }
+
     let _ = tx.send(Bg::GamePrepared { world_builder, ok: true });
 
     if !world_builder {
@@ -649,7 +678,7 @@ fn run_launch(request: LaunchRequest, tx: Sender<Bg>) {
     let result = if world_builder {
         launcher::run_world_builder(&versions, &proton).map(|()| false)
     } else {
-        launcher::run_game(&versions, windowed, quick_start, &game_params, &proton)
+        launcher::run_game(&versions, windowed, quick_start, &game_params, engine_exe.as_deref(), &proton)
             .map(|o| o.played_long_enough)
     };
 
@@ -819,12 +848,20 @@ pub fn spawn_manual_add(
 ) {
     runtime.spawn_blocking(move || {
         let target = config::game_path(&target_relative);
-        let status_tx = tx.clone();
-        let status = move |text: &str| {
-            let _ = status_tx.send(Bg::ManualAddStatus(text.to_owned()));
+        // Extraction reports every few kilobytes. Only what changes the bar
+        // is passed on: a new label, or a new whole percent.
+        let progress_tx = tx.clone();
+        let shown = std::sync::Mutex::new((String::new(), None::<i32>));
+        let progress = move |label: String, fraction: Option<f32>| {
+            let percent = fraction.map(|f| (f * 100.0) as i32);
+            let mut shown = shown.lock().unwrap_or_else(|e| e.into_inner());
+            if shown.0 != label || shown.1 != percent {
+                *shown = (label.clone(), percent);
+                let _ = progress_tx.send(Bg::ManualAddProgress { label, fraction });
+            }
         };
 
-        let message = match install_files(&files, &target, game, &status) {
+        let message = match install_files(&files, &target, game, &progress) {
             Ok(report) => Bg::ManualAddDone {
                 error: None,
                 archives: files
@@ -849,16 +886,32 @@ fn install_files(
     files: &[PathBuf],
     target: &std::path::Path,
     game: Game,
-    status: &dyn Fn(&str),
+    progress: &dyn Fn(String, Option<f32>),
 ) -> anyhow::Result<InstallReport> {
+    use game::mod_archive::Stage;
+
     let mut report = InstallReport::default();
 
-    for file in files {
+    for (index, file) in files.iter().enumerate() {
+        // With several files picked, say which one this is.
+        let which = if files.len() > 1 {
+            format!("[{}/{}] ", index + 1, files.len())
+        } else {
+            String::new()
+        };
+
         if crate::util::archive::is_supported_archive(file) {
-            report.merge(&game::mod_archive::install(file, target, game, status)?);
+            let staged = |stage: Stage, fraction: Option<f32>| {
+                progress(
+                    format!("{which}{}/{}  {}", stage.number(), Stage::COUNT, stage.label()),
+                    fraction,
+                );
+            };
+            report.merge(&game::mod_archive::install(file, target, game, &staged)?);
             continue;
         }
 
+        progress(format!("{which}{}", gfs::file_name_of(file)), None);
         std::fs::create_dir_all(target)?;
         let copied = target.join(gfs::file_name_of(file));
         if !copied.exists() {

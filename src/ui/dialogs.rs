@@ -2,7 +2,7 @@
 
 use egui::{Color32, Context, RichText};
 
-use crate::app::{DialogKind, GenLauncherApp};
+use crate::app::{Answer, DialogKind, GenLauncherApp};
 use crate::config;
 use crate::i18n;
 use crate::model::ModificationType;
@@ -89,6 +89,7 @@ pub fn show_dialog(app: &mut GenLauncherApp, ctx: &Context) {
     let message = dialog.message.clone();
     let confirm_label = dialog.confirm_label.clone();
     let cancel_label = dialog.cancel_label.clone();
+    let alternate_label = dialog.alternate_label.clone();
     let has_choice = dialog.has_choice;
 
     let mut answer = None;
@@ -110,22 +111,28 @@ pub fn show_dialog(app: &mut GenLauncherApp, ctx: &Context) {
         ui.label(RichText::new(&message).size(14.0));
         ui.add_space(14.0);
 
-        ui.horizontal(|ui| {
+        // Wrapped, so three long labels still fit the dialog.
+        ui.horizontal_wrapped(|ui| {
             if has_choice {
                 if ui.button(RichText::new(&confirm_label).size(14.0)).clicked() {
-                    answer = Some(true);
+                    answer = Some(Answer::Confirm);
+                }
+                if let Some(label) = &alternate_label {
+                    if ui.button(RichText::new(label).size(14.0)).clicked() {
+                        answer = Some(Answer::Alternate);
+                    }
                 }
                 if ui.button(RichText::new(&cancel_label).size(14.0)).clicked() {
-                    answer = Some(false);
+                    answer = Some(Answer::Cancel);
                 }
             } else if ui.button(RichText::new(i18n::tr("Ok")).size(14.0)).clicked() {
-                answer = Some(true);
+                answer = Some(Answer::Confirm);
             }
         });
     });
 
-    if let Some(confirmed) = answer {
-        app.answer_dialog(confirmed);
+    if let Some(answer) = answer {
+        app.answer_dialog(answer);
     }
 }
 
@@ -248,6 +255,11 @@ pub fn show_manual_add(app: &mut GenLauncherApp, ctx: &Context) {
 
     if submit {
         app.busy = true;
+        // Shown at once, before the worker has anything to report.
+        app.add_progress = Some(crate::app::AddProgress {
+            label: i18n::tr("Preparing"),
+            fraction: None,
+        });
         tasks::spawn_manual_add(
             app.runtime(),
             state.files.clone(),

@@ -151,9 +151,20 @@
  "ProtonVirtualDesktop": "Run the game in a Wine virtual desktop (needed for the mouse to work on a second monitor)",
  "RarToolMissing": "{0} is a RAR archive. Unpacking those needs 7-Zip or UnRAR, and neither was found.\n\nInstall 7-Zip (https://www.7-zip.org) and try again, or extract the archive yourself and add its .big files, or re-pack it as a .zip.",
  "ArchiveComparing": "Comparing with the game's files...",
- "ArchiveAddedTitle": "Modification added",
- "ArchiveAdded": "The modification was added.",
+ "ArchiveAddedTitle": "Mod added.",
  "ArchiveSkipped": "{0} files identical to the game's own were left out ({1} MB).",
  "ArchiveDeleteQuestion": "Delete the original archive, now that it is installed?\n{0}",
- "ArchiveKeep": "Keep"
+ "ArchiveKeep": "Keep",
+ "EngineTitle": "This mod has its own game engine",
+ "EngineDetected": "{0} ships its own game executable ({1}), a modified build of the game engine.",
+ "EngineEvidence": "Its data uses {0} definition(s) that only that engine understands ({1}), so it will most likely crash while loading on the standard engine.",
+ "EngineNoEvidence": "Its data may rely on it.",
+ "EngineWarning": "That executable comes from the mod's author, not from the game or from this launcher. Run it only if you trust this mod.",
+ "EngineRemembered": "Your choice is remembered for this mod. Right-click its card to change it.",
+ "EngineUseOwn": "Use the mod's engine",
+ "EngineUseStandard": "Use the standard engine",
+ "EngineDoNotLaunch": "Don't launch",
+ "EngineMenu": "Game engine",
+ "EngineAskAgain": "Ask at the next launch",
+ "ArchiveFinishing": "Moving files into place..."
 }

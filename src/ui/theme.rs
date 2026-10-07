@@ -86,6 +86,57 @@ pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
 
 /// A progress bar drawn in the launcher's own colours, with the status line
 /// centred on top the way the WPF `InfoTextBlock` sat over the bar.
+/// A progress bar for a job whose steps cannot always say how far along they
+/// are. With a fraction it fills; without one a block slides across, so the
+/// user can still see that work is going on.
+pub fn stage_progress_bar(
+    ui: &mut Ui,
+    palette: &Palette,
+    fraction: Option<f32>,
+    label: &str,
+    height: f32,
+) {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+
+    let painter = ui.painter();
+    let radius = CornerRadius::same(2);
+    painter.rect_filled(rect, radius, palette.button_selection);
+
+    let fill = palette.active.gamma_multiply(0.85);
+    match fraction {
+        Some(fraction) => {
+            let mut filled = rect;
+            filled.set_width(rect.width() * fraction.clamp(0.0, 1.0));
+            painter.rect_filled(filled, radius, fill);
+        }
+        None => {
+            // A quarter-width block, crossing the bar every two seconds.
+            const BLOCK: f32 = 0.25;
+            let phase = (ui.input(|i| i.time) / 2.0).fract() as f32;
+            let left = rect.left() + (rect.width() * (1.0 + BLOCK)) * phase - rect.width() * BLOCK;
+            let block = egui::Rect::from_min_max(
+                egui::pos2(left.max(rect.left()), rect.top()),
+                egui::pos2((left + rect.width() * BLOCK).min(rect.right()), rect.bottom()),
+            );
+            painter.rect_filled(block, radius, fill);
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+        }
+    }
+
+    painter.rect_stroke(rect, radius, Stroke::new(1.0_f32, palette.border), egui::StrokeKind::Inside);
+
+    if !label.is_empty() {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(12.0),
+            palette.download_text,
+        );
+    }
+}
+
 pub fn progress_bar(
     ui: &mut Ui,
     palette: &Palette,
@@ -179,4 +230,72 @@ pub fn heading(ui: &mut Ui, palette: &Palette, text: &str) {
     ui.add_space(4.0);
     ui.label(egui::RichText::new(text).size(16.0).strong().color(palette.active));
     ui.add_space(2.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Game;
+
+    /// Draw the bar headless in a 400-wide slot. Returns the filled
+    /// rectangles painted (the track first, then what fills it) as
+    /// `(left edge relative to the bar, width)`, and the text drawn.
+    fn painted(fraction: Option<f32>, time: f64) -> (Vec<(f32, f32)>, Vec<String>) {
+        let palette = Palette::for_game(Game::ZeroHour);
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 200.0));
+        let input = egui::RawInput { screen_rect: Some(screen), time: Some(time), ..Default::default() };
+
+        let output = ctx.run_ui(input, |ui| {
+            ui.allocate_ui(Vec2::new(400.0, 22.0), |ui| {
+                ui.set_width(400.0);
+                stage_progress_bar(ui, &palette, fraction, "1/3  Unpacking... 25%", 22.0);
+            });
+        });
+
+        fn walk(shape: &egui::Shape, rects: &mut Vec<egui::Rect>, texts: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Rect(rect) if rect.fill != Color32::TRANSPARENT => rects.push(rect.rect),
+                egui::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, rects, texts)),
+                _ => {}
+            }
+        }
+        let (mut rects, mut texts) = (Vec::new(), Vec::new());
+        output.shapes.iter().for_each(|clipped| walk(&clipped.shape, &mut rects, &mut texts));
+        output.drop_without_applying_deltas();
+
+        let origin = rects.first().map_or(0.0, |track| track.left());
+        (rects.iter().map(|r| (r.left() - origin, r.width())).collect(), texts)
+    }
+
+    #[test]
+    fn a_known_fraction_fills_that_share_of_the_bar() {
+        let (rects, texts) = painted(Some(0.25), 0.0);
+        assert_eq!(rects.len(), 2, "expected a track and a fill: {rects:?}");
+        let (track, fill) = (rects[0], rects[1]);
+        assert!((track.1 - 400.0).abs() < 0.5, "the track is {} wide", track.1);
+        assert!(fill.0.abs() < 0.5, "the fill starts at {}", fill.0);
+        assert!((fill.1 - 100.0).abs() < 0.5, "the fill is {} wide", fill.1);
+        assert_eq!(texts, ["1/3  Unpacking... 25%"]);
+    }
+
+    #[test]
+    fn an_unknown_fraction_shows_a_block_that_moves_across() {
+        let block_at = |time: f64| {
+            let (rects, _) = painted(None, time);
+            assert_eq!(rects.len(), 2, "expected a track and a block: {rects:?}");
+            rects[1]
+        };
+
+        // Mid-sweep the block is a quarter of the bar, wholly inside it.
+        let (early_left, early_width) = block_at(0.8);
+        let (later_left, later_width) = block_at(1.2);
+        assert!((early_width - 100.0).abs() < 0.5, "the block is {early_width} wide");
+        assert!((later_width - 100.0).abs() < 0.5, "the block is {later_width} wide");
+        assert!(early_left >= 0.0 && later_left + later_width <= 400.5);
+
+        // And it has moved to the right in between.
+        assert!(later_left > early_left + 50.0, "block at {early_left}, then {later_left}");
+    }
 }

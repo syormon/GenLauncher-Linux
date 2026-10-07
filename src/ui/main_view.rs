@@ -39,6 +39,7 @@ pub fn show(app: &mut GenLauncherApp, ui: &mut egui::Ui) {
             tab_strip(app, ui);
             ui.add_space(5.0);
             add_buttons(app, ui);
+            add_progress_bar(app, ui);
             ui.add_space(6.0);
             list(app, ui);
         });
@@ -164,12 +165,32 @@ fn add_buttons(app: &mut GenLauncherApp, ui: &mut egui::Ui) {
         if app.busy {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add(egui::Spinner::new().size(18.0).color(app.palette.active));
-                if !app.busy_status.is_empty() {
-                    ui.label(RichText::new(&app.busy_status).size(12.0));
-                }
             });
         }
     });
+}
+
+/// A full-width bar under the buttons while a mod is being added from files:
+/// unpacking a large archive takes minutes and should not look like a hang.
+fn add_progress_bar(app: &GenLauncherApp, ui: &mut egui::Ui) {
+    let Some(progress) = &app.add_progress else { return };
+
+    ui.add_space(5.0);
+    theme::stage_progress_bar(
+        ui,
+        &app.palette,
+        progress.fraction,
+        &add_progress_text(&progress.label, progress.fraction),
+        22.0,
+    );
+}
+
+/// `2/3  Comparing with the game's files... 40%`
+fn add_progress_text(label: &str, fraction: Option<f32>) -> String {
+    match fraction {
+        Some(fraction) => format!("{label} {:.0}%", (fraction.clamp(0.0, 1.0) * 100.0).floor()),
+        None => label.to_owned(),
+    }
 }
 
 fn start_manual_add(app: &mut GenLauncherApp, kind: ModificationType) {
@@ -250,6 +271,7 @@ fn mods_list(app: &mut GenLauncherApp, ui: &mut egui::Ui) {
             connected: app.store.connected,
             enabled: !app.busy,
             thank_you: app.thank_you_for.as_ref() == Some(&key),
+            engine: app.engine_menu_state(&modification),
         };
 
         let outcome = mod_row::mod_row(ui, &mut app.images, &modification, context);
@@ -341,6 +363,7 @@ fn dependent_list(app: &mut GenLauncherApp, ui: &mut egui::Ui, kind: Modificatio
             connected: app.store.connected,
             enabled: !app.busy,
             thank_you: false,
+            engine: None,
         };
 
         let outcome = mod_row::addon_row(ui, modification, context);
@@ -432,6 +455,8 @@ fn apply_action(
         }
 
         RowAction::OpenUrl(url) => util::open_external(&url),
+
+        RowAction::SetEngine(choice) => app.set_engine_choice(name, choice),
 
         RowAction::OpenModFolder => open_mod_folder(app, kind, name),
 
@@ -560,6 +585,33 @@ fn set_mod_image(
 // Side panel
 // ---------------------------------------------------------------------------
 
+/// A side-panel button, exactly `size`, with its label centred on one line.
+///
+/// `add_sized` is what centres the label; `Button::min_size` only makes the
+/// button bigger and leaves the label at the left. The label is also kept to
+/// one line, by stepping the font down when the panel is narrow or a
+/// translation runs long: a wrapped label is centred as a block, but its
+/// lines stay left-aligned within it, which reads as off-centre.
+fn side_button(ui: &mut egui::Ui, size: Vec2, label: &str, font_size: f32) -> egui::Response {
+    const SMALLEST: f32 = 11.0;
+
+    let room = size.x - 2.0 * ui.spacing().button_padding.x;
+    let width_at = |points: f32| {
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), egui::FontId::proportional(points), egui::Color32::WHITE)
+            .size()
+            .x
+    };
+
+    let mut points = font_size;
+    while points > SMALLEST && width_at(points) > room {
+        points -= 1.0;
+    }
+
+    // Truncation is the last resort, for a label too long even at the smallest size.
+    ui.add_sized(size, egui::Button::new(RichText::new(label).size(points)).truncate())
+}
+
 fn side_panel(app: &mut GenLauncherApp, ui: &mut egui::Ui) {
     let width = ui.available_width();
     let button = Vec2::new(width, 38.0);
@@ -568,31 +620,19 @@ fn side_panel(app: &mut GenLauncherApp, ui: &mut egui::Ui) {
     ui.add_space(10.0);
 
     ui.add_enabled_ui(enabled, |ui| {
-        if ui
-            .add_sized(button, egui::Button::new(RichText::new(i18n::tr("Launch")).size(17.0)))
-            .clicked()
-        {
+        if side_button(ui, button, &i18n::tr("Launch"), 17.0).clicked() {
             app.request_launch(false);
         }
 
         ui.add_space(4.0);
-        if ui
-            .add_sized(
-                button,
-                egui::Button::new(RichText::new(i18n::tr("WorldBuilder")).size(17.0)),
-            )
-            .clicked()
-        {
+        if side_button(ui, button, &i18n::tr("WorldBuilder"), 17.0).clicked() {
             app.request_launch(true);
         }
 
         ui.add_space(4.0);
         let windowed_label =
             if app.store.data.windowed { "ChangeToFullScreen" } else { "ChangeToWindowed" };
-        if ui
-            .add_sized(button, egui::Button::new(RichText::new(i18n::tr(windowed_label)).size(15.0)))
-            .clicked()
-        {
+        if side_button(ui, button, &i18n::tr(windowed_label), 15.0).clicked() {
             app.store.data.windowed = !app.store.data.windowed;
             app.store.save();
         }
@@ -602,31 +642,21 @@ fn side_panel(app: &mut GenLauncherApp, ui: &mut egui::Ui) {
         let quick_enabled = app.session.game_mode == Game::ZeroHour;
         let quick_label =
             if app.store.data.quick_start { "ChangeToNormalStart" } else { "ChangeToQuickStart" };
-        if ui
-            .add_enabled(
-                quick_enabled,
-                egui::Button::new(RichText::new(i18n::tr(quick_label)).size(15.0))
-                    .min_size(button),
-            )
-            .clicked()
-        {
+        let quick_start = ui
+            .add_enabled_ui(quick_enabled, |ui| side_button(ui, button, &i18n::tr(quick_label), 15.0))
+            .inner;
+        if quick_start.clicked() {
             app.store.data.quick_start = !app.store.data.quick_start;
             app.store.save();
         }
 
         ui.add_space(4.0);
-        if ui
-            .add_sized(button, egui::Button::new(RichText::new(i18n::tr("Options")).size(17.0)))
-            .clicked()
-        {
+        if side_button(ui, button, &i18n::tr("Options"), 17.0).clicked() {
             app.options = Some(crate::ui::options_view::OptionsState::open(app));
         }
 
         ui.add_space(12.0);
-        if ui
-            .add_sized(button, egui::Button::new(RichText::new(i18n::tr("Exit")).size(17.0)))
-            .clicked()
-        {
+        if side_button(ui, button, &i18n::tr("Exit"), 17.0).clicked() {
             app.request_quit();
         }
     });
@@ -690,6 +720,66 @@ mod tests {
             output.drop_without_applying_deltas();
         }
         actual
+    }
+
+    /// Lay a side button out headless; returns the button's rectangle and the
+    /// rectangle and line count of the label drawn inside it.
+    fn side_button_layout(label: &str, width: f32, font_size: f32) -> (egui::Rect, egui::Rect, usize) {
+        fn text_of(shape: &egui::Shape) -> Option<(egui::Rect, usize)> {
+            match shape {
+                egui::Shape::Text(text) => Some((text.visual_bounding_rect(), text.galley.rows.len())),
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(text_of),
+                _ => None,
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 720.0));
+        let mut button = egui::Rect::NOTHING;
+        let mut drawn = None;
+
+        for _ in 0..3 {
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    button = side_button(ui, Vec2::new(width, 38.0), label, font_size).rect;
+                });
+            });
+            drawn = output.shapes.iter().find_map(|clipped| text_of(&clipped.shape));
+            output.drop_without_applying_deltas();
+        }
+
+        let (text, lines) = drawn.expect("the label was not drawn");
+        (button, text, lines)
+    }
+
+    #[test]
+    fn a_side_button_label_is_centred_on_one_line_at_any_panel_width() {
+        // The widest and the narrowest the side panel gets, less its margins.
+        for width in [304.0, 253.0, 204.0] {
+            for label in ["CHANGE TO NORMAL START", "CHANGE TO FULL SCREEN", "EXIT"] {
+                let (button, text, lines) = side_button_layout(label, width, 15.0);
+                assert_eq!(lines, 1, "{label:?} wrapped in a {width}px button");
+                assert!((button.width() - width).abs() < 0.5, "button is {}px", button.width());
+                assert!(
+                    (text.center().x - button.center().x).abs() < 1.5,
+                    "{label:?} in a {width}px button: text centre {}, button centre {}",
+                    text.center().x,
+                    button.center().x,
+                );
+                assert!(text.left() >= button.left() && text.right() <= button.right());
+            }
+        }
+    }
+
+    #[test]
+    fn the_add_progress_text_shows_a_percentage_only_when_there_is_one() {
+        assert_eq!(add_progress_text("1/3  Unpacking...", Some(0.426)), "1/3  Unpacking... 42%");
+        assert_eq!(add_progress_text("1/3  Unpacking...", Some(1.0)), "1/3  Unpacking... 100%");
+        // Never "100%" before it is done, and never out of range.
+        assert_eq!(add_progress_text("x", Some(0.999)), "x 99%");
+        assert_eq!(add_progress_text("x", Some(7.0)), "x 100%");
+        assert_eq!(add_progress_text("3/3  Moving files into place...", None), "3/3  Moving files into place...");
     }
 
     #[test]

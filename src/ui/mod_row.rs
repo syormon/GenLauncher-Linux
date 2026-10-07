@@ -9,7 +9,7 @@ use crate::app::DownloadState;
 use crate::config;
 use crate::i18n;
 use crate::model::colors::Palette;
-use crate::model::{GameModification, ModificationType};
+use crate::model::{EngineChoice, GameModification, ModificationType};
 use crate::ui::theme;
 use crate::util::fs as gfs;
 
@@ -27,6 +27,8 @@ pub enum RowAction {
     SelectVersion(String),
     DeleteVersion(String),
     OpenUrl(String),
+    /// Which game engine to start this mod with, when it ships its own.
+    SetEngine(EngineChoice),
     OpenModFolder,
     SetImage,
     OpenGameFolder,
@@ -51,6 +53,8 @@ pub struct RowContext<'a> {
     pub enabled: bool,
     /// Pulse the support button after a good session.
     pub thank_you: bool,
+    /// Set for a mod known to ship its own game engine: the current choice.
+    pub engine: Option<EngineChoice>,
 }
 
 /// Draw a full mod row.
@@ -185,7 +189,7 @@ pub fn mod_row(
         action = RowAction::Deselect;
     }
 
-    if let Some(menu_action) = context_menu(&response, modification) {
+    if let Some(menu_action) = context_menu(&response, modification, ctx.engine) {
         action = menu_action;
     }
 
@@ -272,7 +276,7 @@ pub fn addon_row(
         action = RowAction::Deselect;
     }
 
-    if let Some(menu_action) = context_menu(&response, modification) {
+    if let Some(menu_action) = context_menu(&response, modification, ctx.engine) {
         action = menu_action;
     }
 
@@ -429,6 +433,7 @@ fn update_button(
 fn context_menu(
     response: &egui::Response,
     modification: &GameModification,
+    engine: Option<EngineChoice>,
 ) -> Option<RowAction> {
     let mut action = None;
 
@@ -450,6 +455,23 @@ fn context_menu(
         if !info.discord_link.is_empty() && ui.button(i18n::tr("Discord")).clicked() {
             action = Some(RowAction::OpenUrl(info.discord_link.clone()));
             ui.close();
+        }
+
+        // Only for a mod that ships its own game engine.
+        if let Some(current) = engine {
+            ui.separator();
+            ui.menu_button(i18n::tr("EngineMenu"), |ui| {
+                for (choice, label) in [
+                    (EngineChoice::Own, "EngineUseOwn"),
+                    (EngineChoice::Standard, "EngineUseStandard"),
+                    (EngineChoice::Ask, "EngineAskAgain"),
+                ] {
+                    if ui.radio(current == choice, i18n::tr(label)).clicked() {
+                        action = Some(RowAction::SetEngine(choice));
+                        ui.close();
+                    }
+                }
+            });
         }
 
         ui.separator();
@@ -539,6 +561,7 @@ mod tests {
             },
             is_selected: true,
             installed: true,
+            ..Default::default()
         };
         let modification = GameModification::new(&installed);
         let row = RowContext {
@@ -550,6 +573,7 @@ mod tests {
             connected: true,
             enabled: true,
             thank_you: false,
+            engine: None,
         };
 
         let ctx = egui::Context::default();

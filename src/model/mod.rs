@@ -109,6 +109,24 @@ pub struct ReposVersion {
     pub replaces_original_wb_file: bool,
 }
 
+/// Which game engine a mod that ships its own is started with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineChoice {
+    /// Not decided yet: ask at the next launch.
+    #[default]
+    Ask,
+    /// The game's own engine (or the launcher's modded one), as for any mod.
+    Standard,
+    /// The executable the mod brought with it.
+    Own,
+}
+
+impl EngineChoice {
+    pub fn is_ask(&self) -> bool {
+        *self == Self::Ask
+    }
+}
+
 /// A repos version plus the local install/selection state. Mirrors `ModificationVersion`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -119,11 +137,14 @@ pub struct ModVersion {
     pub is_selected: bool,
     #[serde(rename = "Installed")]
     pub installed: bool,
+    /// The user's answer for a version that ships its own game engine.
+    #[serde(rename = "Engine", skip_serializing_if = "EngineChoice::is_ask")]
+    pub engine: EngineChoice,
 }
 
 impl From<ReposVersion> for ModVersion {
     fn from(info: ReposVersion) -> Self {
-        Self { info, is_selected: false, installed: false }
+        Self { info, ..Default::default() }
     }
 }
 
@@ -184,6 +205,10 @@ impl ModVersion {
     pub fn union(&mut self, other: &ModVersion) {
         self.is_selected |= other.is_selected;
         self.installed |= other.installed;
+        // A rescan of the mod folder knows nothing of the choice; keep ours.
+        if self.engine.is_ask() {
+            self.engine = other.engine;
+        }
 
         let a = &mut self.info;
         let b = &other.info;
@@ -523,6 +548,37 @@ Version: 1.87 Public Build 2.0
     }
 
     #[test]
+    fn the_engine_choice_is_saved_only_once_made_and_survives_a_rescan() {
+        let installed = |engine| ModVersion {
+            info: ReposVersion { name: "Raptor".into(), version: "9.1".into(), ..Default::default() },
+            installed: true,
+            is_selected: true,
+            engine,
+        };
+
+        // Undecided is the default and leaves no trace in the config.
+        let yaml = serde_yaml_ng::to_string(&installed(EngineChoice::Ask)).unwrap();
+        assert!(!yaml.contains("Engine"), "an undecided choice was written:
+{yaml}");
+        let read: ModVersion = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(read.engine, EngineChoice::Ask);
+
+        // A decision is written and read back.
+        let yaml = serde_yaml_ng::to_string(&installed(EngineChoice::Own)).unwrap();
+        assert!(yaml.contains("Engine: Own"), "the choice is missing:
+{yaml}");
+        let read: ModVersion = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(read.engine, EngineChoice::Own);
+
+        // Start-up rescans the mod folder and merges what it finds, which
+        // knows nothing about engines, into the saved record.
+        let mut data = LauncherData::default();
+        data.add_or_update(&installed(EngineChoice::Standard));
+        data.add_or_update(&installed(EngineChoice::Ask));
+        assert_eq!(data.modifications[0].versions[0].engine, EngineChoice::Standard);
+    }
+
+    #[test]
     fn null_scalars_read_as_empty() {
         let v: ReposVersion = serde_yaml_ng::from_str("Name: X
 DependenceName:
@@ -541,6 +597,7 @@ DependenceName:
             },
             installed: true,
             is_selected: true,
+            ..Default::default()
         });
 
         let yaml = serde_yaml_ng::to_string(&data).unwrap();

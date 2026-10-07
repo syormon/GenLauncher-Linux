@@ -1,6 +1,6 @@
 [package]
 name = "genlauncher"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 rust-version = "1.95"
 description = "Mod manager for Command & Conquer: Generals and Zero Hour"

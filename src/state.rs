@@ -250,6 +250,7 @@ impl Store {
                         },
                         installed: true,
                         is_selected: false,
+                        ..Default::default()
                     };
                     self.data.add_or_update(&version);
                 }
@@ -283,6 +284,7 @@ impl Store {
                     },
                     installed: true,
                     is_selected: false,
+                    ..Default::default()
                 };
                 self.data.add_or_update(&version);
             }
@@ -463,6 +465,7 @@ mod tests {
             },
             installed: true,
             is_selected: false,
+            ..Default::default()
         }
     }
 

@@ -260,6 +260,7 @@ pub fn run_game(
     windowed: bool,
     quick_start: bool,
     extra_params: &str,
+    engine: Option<&str>,
     proton: &ProtonSettings,
 ) -> Result<RunOutcome> {
     let executables: Vec<&ModVersion> = versions
@@ -267,11 +268,14 @@ pub fn run_game(
         .filter(|v| v.kind() == ModificationType::Executable && !v.info.replaces_original_wb_file)
         .collect();
 
-    let main_exe = executables
-        .iter()
-        .find(|v| v.info.replaces_original_game_file)
-        .map(|v| v.info.executable_file_name.clone())
-        .unwrap_or_else(|| "generals.exe".to_owned());
+    // A mod's own engine, when the user chose it, comes before everything else.
+    let main_exe = engine.map(str::to_owned).unwrap_or_else(|| {
+        executables
+            .iter()
+            .find(|v| v.info.replaces_original_game_file)
+            .map(|v| v.info.executable_file_name.clone())
+            .unwrap_or_else(|| "generals.exe".to_owned())
+    });
 
     let mut args = Vec::new();
     if windowed {
@@ -303,6 +307,25 @@ pub fn run_game(
     wait_for_game_processes(&main_exe);
 
     Ok(RunOutcome { played_long_enough: started.elapsed().as_secs() >= 12 })
+}
+
+/// Link the game engine a mod ships into the game folder, and return the
+/// executable to start. Like every other link, `restore_game_folder` undoes it
+/// and puts the game's own file back.
+///
+/// Only the engine is linked. The mod's other binaries stay out, as always.
+pub fn link_custom_engine(mod_version: &ModVersion, file: &str) -> Result<String> {
+    let source = gfs::resolve_case_insensitive(&mod_version.folder_path(), Path::new(file));
+    anyhow::ensure!(source.is_file(), "{file} is no longer in the mod's folder");
+
+    // Matched to the game's own casing, so the stashed original is restored
+    // under the name it had.
+    let target = gfs::resolve_case_insensitive(config::game_dir(), Path::new(file));
+    symlinks::create_mirror_for_non_big(&source, &target)
+        .with_context(|| format!("cannot link {file} into the game folder"))?;
+
+    // An engine shipped as `game.dat` is started by the game's `generals.exe`.
+    Ok(if file.eq_ignore_ascii_case("game.dat") { "generals.exe".to_owned() } else { file.to_owned() })
 }
 
 /// Start World Builder and block until it exits.
@@ -458,6 +481,7 @@ mod tests {
             },
             is_selected: true,
             installed: true,
+            ..Default::default()
         };
         let session = crate::tasks::session_info(Game::ZeroHour, false);
 
@@ -474,7 +498,7 @@ mod tests {
             virtual_desktop: false,
         };
         let started = Instant::now();
-        run_game(std::slice::from_ref(&version), true, true, "-extra", &settings).unwrap();
+        run_game(std::slice::from_ref(&version), true, true, "-extra", None, &settings).unwrap();
         assert!(
             started.elapsed() >= Duration::from_secs(3),
             "returned before game.dat exited ({:?})",
