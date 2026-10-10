@@ -26,6 +26,7 @@ This is a based off of [GenLauncher](https://github.com/p0ls3r/GenLauncher). Tes
 * `.rar` extraction uses 7-Zip, `unrar` or `unar` if one is installed (on PATH, or in 7-Zip's or WinRAR's default folder on Windows). `.zip` and `.7z` need nothing.
 * **Add mod from files understands downloaded archives.** Pick the `.zip`/`.rar`/`.7z` as downloaded (e.g. from ModDB): the name and version are suggested from the file name, wrapper folders are stepped through, a full-game repack is reduced to the files the mod actually changes, and you are asked afterwards whether to delete the archive.
 * **Mods with their own game engine.** A mod's `.exe`/`.dll` files are never linked into the game. If a mod ships a *modified game engine* (and so crashes with "Technical Difficulties" on the normal one), the launcher detects it at launch and asks whether to run the mod's engine, the standard one, or not launch. The answer is kept per mod; right-click the mod's card to change it.
+* **Launch vanilla.** A second launch button starts the game with no mods, patches or add-ons, whatever is selected, and leaves the selection alone. GenTool is still used, even when its option is off.
 * No self-update
 * No advertising card
 * **Modded executable.** `Use modded exe files` [default] now downloads the repository's `ModdedExe` and runs it.

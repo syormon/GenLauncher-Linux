@@ -86,6 +86,25 @@ pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
 
 /// A progress bar drawn in the launcher's own colours, with the status line
 /// centred on top the way the WPF `InfoTextBlock` sat over the bar.
+/// A selectable list row whose size does not depend on its state.
+///
+/// egui draws a selectable label with no frame until it is hovered or
+/// selected, and a frame's 1px border takes up space. So the row under the
+/// pointer grew by 2px each way, and whatever was sized to the list, a dialog
+/// or a drop-down, twitched as the pointer moved over it. Here the frame is
+/// always there; on an idle row it is simply invisible.
+pub fn selectable_row<'a>(ui: &mut Ui, selected: bool, text: impl egui::IntoAtoms<'a>) -> egui::Response {
+    ui.scope(|ui| {
+        let idle = &mut ui.visuals_mut().widgets.inactive;
+        idle.bg_stroke.color = Color32::TRANSPARENT;
+        idle.bg_fill = Color32::TRANSPARENT;
+        idle.weak_bg_fill = Color32::TRANSPARENT;
+
+        ui.add(egui::Button::selectable(selected, text).frame_when_inactive(true))
+    })
+    .inner
+}
+
 /// A progress bar for a job whose steps cannot always say how far along they
 /// are. With a fraction it fills; without one a block slides across, so the
 /// user can still see that work is going on.
@@ -267,6 +286,49 @@ mod tests {
 
         let origin = rects.first().map_or(0.0, |track| track.left());
         (rects.iter().map(|r| (r.left() - origin, r.width())).collect(), texts)
+    }
+
+    /// The size a list row comes out at, headless, in a given state.
+    /// `plain` uses egui's own selectable label instead of ours.
+    fn row_size(selected: bool, hovered: bool, plain: bool) -> Vec2 {
+        let ctx = egui::Context::default();
+        let palette = Palette::for_game(Game::ZeroHour);
+        apply(&ctx, &palette);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let mut rect = egui::Rect::NOTHING;
+
+        // Hover takes a frame to register: the pointer is placed on the row
+        // once its position is known, and the row reacts on the next pass.
+        for _ in 0..4 {
+            let mut input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            if hovered && rect.is_positive() {
+                input.events.push(egui::Event::PointerMoved(rect.center()));
+            }
+            let output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let text = egui::RichText::new("Rise of the Reds").size(14.0);
+                    rect = if plain {
+                        ui.selectable_label(selected, text).rect
+                    } else {
+                        selectable_row(ui, selected, text).rect
+                    };
+                });
+            });
+            output.drop_without_applying_deltas();
+        }
+        rect.size()
+    }
+
+    #[test]
+    fn a_list_row_keeps_its_size_when_hovered_or_selected() {
+        let idle = row_size(false, false, false);
+        assert_eq!(row_size(false, true, false), idle, "the row changed size under the pointer");
+        assert_eq!(row_size(true, false, false), idle, "the row changed size when selected");
+        assert_eq!(row_size(true, true, false), idle, "the selected row changed size under the pointer");
+
+        // What this replaces does change, which is the whole reason it exists.
+        // Should egui stop doing that, this fails and the helper can go.
+        assert_ne!(row_size(false, true, true), row_size(false, false, true));
     }
 
     #[test]

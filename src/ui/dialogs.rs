@@ -167,7 +167,8 @@ pub fn show_add_mod(app: &mut GenLauncherApp, ctx: &Context) {
                     continue;
                 }
                 let selected = state.selected.as_deref() == Some(name.as_str());
-                if ui.selectable_label(selected, RichText::new(name).size(14.0)).clicked() {
+                let row = crate::ui::theme::selectable_row(ui, selected, RichText::new(name).size(14.0));
+                if row.clicked() {
                     state.selected = Some(name.clone());
                 }
             }

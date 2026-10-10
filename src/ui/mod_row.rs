@@ -368,8 +368,7 @@ fn version_picker(
             .show_ui(ui, |ui| {
                 for version in &ctx.installed_versions {
                     ui.horizontal(|ui| {
-                        if ui
-                            .selectable_label(*version == current, RichText::new(version).size(13.0))
+                        if theme::selectable_row(ui, *version == current, RichText::new(version).size(13.0))
                             .clicked()
                         {
                             action = Some(RowAction::SelectVersion(version.clone()));

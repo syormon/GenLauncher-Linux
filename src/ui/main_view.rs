@@ -625,6 +625,14 @@ fn side_panel(app: &mut GenLauncherApp, ui: &mut egui::Ui) {
         }
 
         ui.add_space(4.0);
+        if side_button(ui, button, &i18n::tr("LaunchVanilla"), 17.0)
+            .on_hover_text(i18n::tr("LaunchVanillaHint"))
+            .clicked()
+        {
+            app.request_vanilla_launch();
+        }
+
+        ui.add_space(4.0);
         if side_button(ui, button, &i18n::tr("WorldBuilder"), 17.0).clicked() {
             app.request_launch(true);
         }

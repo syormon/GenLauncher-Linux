@@ -346,8 +346,7 @@ fn game_settings(app: &mut GenLauncherApp, state: &mut OptionsState, ui: &mut eg
                     all.push(state.resolution.clone());
                 }
                 for entry in all {
-                    if ui
-                        .selectable_label(entry == state.resolution, &entry)
+                    if crate::ui::theme::selectable_row(ui, entry == state.resolution, entry.as_str())
                         .clicked()
                     {
                         state.resolution = entry.clone();

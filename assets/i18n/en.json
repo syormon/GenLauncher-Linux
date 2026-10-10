@@ -166,5 +166,7 @@
  "EngineDoNotLaunch": "Don't launch",
  "EngineMenu": "Game engine",
  "EngineAskAgain": "Ask at the next launch",
- "ArchiveFinishing": "Moving files into place..."
+ "ArchiveFinishing": "Moving files into place...",
+ "LaunchVanilla": "LAUNCH VANILLA",
+ "LaunchVanillaHint": "Start the game with no mods, patches or add-ons, whatever is selected. Your selection is kept. GenTool is still used."
 }

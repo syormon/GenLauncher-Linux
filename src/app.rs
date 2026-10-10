@@ -157,6 +157,10 @@ pub struct GenLauncherApp {
     pending_dialogs: Vec<Dialog>,
 
     pub busy: bool,
+    /// The launch under way was asked for with "Launch vanilla": the game with
+    /// nothing selected applied. Set when a game launch is requested and
+    /// cleared when the game exits.
+    vanilla_launch: bool,
     /// Progress of an "add mod from files" install, while one is running.
     pub add_progress: Option<AddProgress>,
     pub game_running: bool,
@@ -227,6 +231,7 @@ impl GenLauncherApp {
             dialog: None,
             pending_dialogs: Vec::new(),
             busy: false,
+            vanilla_launch: false,
             add_progress: None,
             game_running: false,
             world_builder_running: false,
@@ -524,15 +529,18 @@ impl GenLauncherApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
+                // A vanilla session played no mod, so there is none to thank.
+                let played_a_mod = !self.is_vanilla(world_builder);
                 if world_builder {
                     self.world_builder_running = false;
                 } else {
                     self.game_running = false;
+                    self.vanilla_launch = false;
                 }
 
                 if let Some(error) = error {
                     self.show_dialog(Dialog::error(i18n::tr("LaunchAborted"), error));
-                } else if played_long_enough {
+                } else if played_long_enough && played_a_mod {
                     self.thank_you_for =
                         self.store.selected_mod_name().map(|n| ModKey::new(ModificationType::Mod, &n));
                 }
@@ -811,6 +819,22 @@ impl GenLauncherApp {
     // -- launch flow -------------------------------------------------------
 
     /// Entry point for the LAUNCH GAME and WORLD BUILDER buttons.
+    /// Launch the game as it shipped: no mod, patch, add-on or chosen
+    /// executable, whatever is selected, and without changing the selection.
+    /// GenTool is still used, as are the display settings.
+    pub fn request_vanilla_launch(&mut self) {
+        if self.game_running {
+            self.show_dialog(Dialog::error(
+                i18n::tr("LaunchAborted"),
+                i18n::tr("GameRunning"),
+            ));
+            return;
+        }
+
+        self.vanilla_launch = true;
+        self.advance_launch(false, LaunchStep::Validate);
+    }
+
     pub fn request_launch(&mut self, world_builder: bool) {
         if world_builder && self.world_builder_running {
             self.show_dialog(Dialog::error(
@@ -827,15 +851,28 @@ impl GenLauncherApp {
             return;
         }
 
+        // World Builder runs beside the game and must not disturb its state.
+        if !world_builder {
+            self.vanilla_launch = false;
+        }
         self.advance_launch(world_builder, LaunchStep::Validate);
+    }
+
+    /// True for the steps of a "Launch vanilla" request.
+    fn is_vanilla(&self, world_builder: bool) -> bool {
+        self.vanilla_launch && !world_builder
     }
 
     fn advance_launch(&mut self, world_builder: bool, step: LaunchStep) {
         match step {
             LaunchStep::Validate => {
-                if let Some(error) = self.validate_launch(world_builder) {
-                    self.show_dialog(error);
-                    return;
+                // Vanilla uses nothing that is selected, so there is nothing
+                // selected to validate.
+                if !self.is_vanilla(world_builder) {
+                    if let Some(error) = self.validate_launch(world_builder) {
+                        self.show_dialog(error);
+                        return;
+                    }
                 }
                 self.advance_launch(world_builder, LaunchStep::FirstRun);
             }
@@ -855,6 +892,11 @@ impl GenLauncherApp {
             }
 
             LaunchStep::CheckUpdates => {
+                // Every check from here on is about the selected mods.
+                if self.is_vanilla(world_builder) {
+                    self.start_launch(world_builder, false);
+                    return;
+                }
                 if let Some(message) = self.pending_update_message() {
                     self.show_dialog(Dialog::confirm(
                         DialogId::ConfirmUpdates { world_builder },
@@ -1009,13 +1051,15 @@ impl GenLauncherApp {
     }
 
     fn start_launch(&mut self, world_builder: bool, check_files: bool) {
-        let versions = self.store.active_versions();
-        if versions.is_empty() && self.store.selected_mod().is_some() {
+        let vanilla = self.is_vanilla(world_builder);
+        let LaunchSet { versions, has_selected_mod, gentool } = launch_set(&self.store, vanilla);
+        if versions.is_empty() && has_selected_mod {
             return;
         }
 
         // A mod's own engine takes the place of the launcher's modded one.
-        let custom_engine = if world_builder { None } else { self.custom_engine_for_launch() };
+        let custom_engine =
+            if world_builder || vanilla { None } else { self.custom_engine_for_launch() };
         let modded_exe = if world_builder || custom_engine.is_some() {
             None
         } else {
@@ -1037,13 +1081,13 @@ impl GenLauncherApp {
                 versions,
                 session: self.session.clone(),
                 camera_height: self.store.data.camera_height,
-                has_selected_mod: self.store.selected_mod().is_some(),
+                has_selected_mod,
                 check_files,
                 windowed: self.store.data.windowed,
                 quick_start: self.store.data.quick_start,
                 game_params: self.store.data.game_params.clone(),
                 use_vulkan: self.store.data.use_vulkan,
-                gentool_auto_update: self.store.data.auto_update_gentool,
+                gentool_auto_update: gentool,
                 modded_exe,
                 custom_engine,
                 vulkan: self.store.repos.vulkan.clone(),
@@ -1341,6 +1385,32 @@ fn reorder<T>(items: &mut Vec<T>, from: usize, to: usize) -> bool {
     true
 }
 
+/// What a launch runs with.
+struct LaunchSet {
+    /// The mod, patch, add-ons and executables linked into the game folder.
+    versions: Vec<ModVersion>,
+    has_selected_mod: bool,
+    /// Install or update GenTool before starting.
+    gentool: bool,
+}
+
+/// What to run: everything selected, or for a vanilla launch nothing at all.
+///
+/// Vanilla is the game as it shipped plus GenTool, which is there for the
+/// quality-of-life fixes rather than as a mod; it is used even when the
+/// GenTool option is off. The selection itself is only read, never changed.
+fn launch_set(store: &Store, vanilla: bool) -> LaunchSet {
+    if vanilla {
+        LaunchSet { versions: Vec::new(), has_selected_mod: false, gentool: true }
+    } else {
+        LaunchSet {
+            versions: store.active_versions(),
+            has_selected_mod: store.selected_mod().is_some(),
+            gentool: store.data.auto_update_gentool,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum LaunchStep {
     Validate,
@@ -1358,7 +1428,68 @@ pub fn primary_screen_size() -> (u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::reorder;
+    use super::{launch_set, reorder};
+    use crate::config::Game;
+    use crate::model::{ModVersion, ModificationType, ReposVersion};
+    use crate::state::Store;
+
+    /// A store with a mod and one of its add-ons installed and selected.
+    fn store_with_a_selection() -> Store {
+        let installed = |name: &str, kind, dependence: &str| ModVersion {
+            info: ReposVersion {
+                name: name.into(),
+                version: "1.0".into(),
+                modification_type: kind,
+                dependence_name: dependence.into(),
+                ..Default::default()
+            },
+            installed: true,
+            ..Default::default()
+        };
+
+        let mut store = Store::new(Game::ZeroHour);
+        store.data.add_or_update(&installed("ROTR", ModificationType::Mod, ""));
+        store.data.add_or_update(&installed("HUD", ModificationType::Addon, "ROTR"));
+        store.data.modifications[0].set_selected(true);
+        store.data.modifications[0].versions[0].is_selected = true;
+        store.data.addons[0].set_selected(true);
+        store.data.addons[0].versions[0].is_selected = true;
+        store
+    }
+
+    #[test]
+    fn a_normal_launch_runs_everything_selected() {
+        let mut store = store_with_a_selection();
+
+        store.data.auto_update_gentool = false;
+        let set = launch_set(&store, false);
+        let mut names: Vec<&str> = set.versions.iter().map(|v| v.name()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["HUD", "ROTR"]);
+        assert!(set.has_selected_mod);
+        // GenTool follows its option.
+        assert!(!set.gentool);
+
+        store.data.auto_update_gentool = true;
+        assert!(launch_set(&store, false).gentool);
+    }
+
+    #[test]
+    fn a_vanilla_launch_runs_nothing_selected_but_keeps_gentool() {
+        let mut store = store_with_a_selection();
+        store.data.auto_update_gentool = false;
+
+        let set = launch_set(&store, true);
+        assert!(set.versions.is_empty(), "vanilla linked {:?}", set.versions.len());
+        assert!(!set.has_selected_mod);
+        // Even with the GenTool option off.
+        assert!(set.gentool);
+
+        // Asking for vanilla does not touch what is selected or the options.
+        assert_eq!(store.selected_mod_name().as_deref(), Some("ROTR"));
+        assert_eq!(store.active_versions().len(), 2);
+        assert!(!store.data.auto_update_gentool);
+    }
 
     fn order(from: usize, to: usize) -> Vec<&'static str> {
         let mut items = vec!["A", "B", "C", "D"];
