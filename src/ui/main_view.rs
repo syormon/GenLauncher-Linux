@@ -564,15 +564,9 @@ fn set_mod_image(
     let Some(modification) = app.store.modification(kind, name) else { return };
     let Some(latest) = modification.latest_version() else { return };
 
-    let folder = config::game_path(config::LAUNCHER_FOLDER)
-        .join(config::LAUNCHER_IMAGE_SUBFOLDER)
-        .join(gfs::sanitize_file_name(name));
-    let target = folder.join(latest.version());
+    let target = config::mod_image_path(name, latest.version());
 
-    if let Err(e) = std::fs::create_dir_all(&folder).and_then(|()| {
-        let _ = std::fs::remove_file(&target);
-        std::fs::copy(&source, &target).map(|_| ())
-    }) {
+    if let Err(e) = crate::game::mod_archive::save_banner(&source, &target) {
         app.show_dialog(Dialog::error(i18n::tr("OperationAborted"), e.to_string()));
         return;
     }

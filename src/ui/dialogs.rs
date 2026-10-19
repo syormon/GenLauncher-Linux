@@ -261,10 +261,14 @@ pub fn show_manual_add(app: &mut GenLauncherApp, ctx: &Context) {
             label: i18n::tr("Preparing"),
             fraction: None,
         });
+        // Only a mod's card shows artwork, so only a mod takes a banner.
+        let banner = (state.kind == ModificationType::Mod)
+            .then(|| config::mod_image_path(&state.name, &state.version));
         tasks::spawn_manual_add(
             app.runtime(),
             state.files.clone(),
             state.target_relative(),
+            banner,
             app.session.game_mode,
             app.tx.clone(),
         );

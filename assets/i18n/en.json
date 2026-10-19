@@ -73,6 +73,7 @@
  "InstallInProgress": "Cannot launch {0} - installation in progress!",
  "JoinDiscord": "Join GenLauncher Discord!",
  "LatestVersion": "Latest Version: ",
+ "UserAddedMod": "(user added mod)",
  "Launch": "LAUNCH GAME",
  "LaunchAborted": "Launch aborted",
  "LowAndHigh": "Lower - better performance, higher - better graphics quality",

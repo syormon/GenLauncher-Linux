@@ -24,12 +24,52 @@ pub struct InstallReport {
     /// Files left out because the game already has an identical copy.
     pub skipped_files: usize,
     pub skipped_bytes: u64,
+    /// The best picture the mod came with, for its card.
+    pub artwork: Option<Artwork>,
 }
 
 impl InstallReport {
     pub fn merge(&mut self, other: &InstallReport) {
         self.skipped_files += other.skipped_files;
         self.skipped_bytes += other.skipped_bytes;
+        self.offer(other.artwork.clone());
+    }
+
+    /// Keep `found` if it is a better kind of artwork than what was found
+    /// before. Between two of the same kind, the first stays.
+    pub fn offer(&mut self, found: Option<Artwork>) {
+        if let Some(found) = found {
+            if self.artwork.as_ref().is_none_or(|kept| found.kind < kept.kind) {
+                self.artwork = Some(found);
+            }
+        }
+    }
+
+    /// Has a banner been found? Nothing can beat one.
+    pub fn has_banner(&self) -> bool {
+        self.artwork.as_ref().is_some_and(|a| a.kind == ArtworkKind::Banner)
+    }
+}
+
+/// Where a mod's card picture came from, best first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ArtworkKind {
+    /// A `banner.png`/`.jpg`, made for the card.
+    Banner,
+    /// Any bitmap the mod ships, typically its `Install_Final.bmp` splash.
+    Bitmap,
+}
+
+/// A picture found among a mod's files, read in before its folder goes away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Artwork {
+    pub kind: ArtworkKind,
+    pub bytes: Vec<u8>,
+}
+
+impl Artwork {
+    pub fn read(kind: ArtworkKind, path: &Path) -> std::io::Result<Self> {
+        Ok(Self { kind, bytes: std::fs::read(path)? })
     }
 }
 
@@ -63,10 +103,14 @@ impl Stage {
 /// Unpack `archive` and install what it holds into `target`, a version folder
 /// in the mod store. `progress` is told which stage is running and how far
 /// through it is, or `None` when that cannot be known.
+///
+/// With `want_artwork`, the report carries the picture the archive offers for
+/// the mod's card (see [`take_artwork`]).
 pub fn install(
     archive_path: &Path,
     target: &Path,
     game: Game,
+    want_artwork: bool,
     progress: &dyn Fn(Stage, Option<f32>),
 ) -> Result<InstallReport> {
     // Staged beside the target under the suffix that start-up cleans away,
@@ -93,9 +137,14 @@ pub fn install(
         }
 
         progress(Stage::Comparing, None);
-        let report = drop_files_the_game_already_has(&root, game, &|fraction| {
+        let mut report = drop_files_the_game_already_has(&root, game, &|fraction| {
             progress(Stage::Comparing, Some(fraction));
         });
+        // After the comparing, so a stock bitmap a full-game repack carries
+        // is already gone and not taken for the mod's own.
+        if want_artwork {
+            report.artwork = take_artwork(&root, &staging);
+        }
 
         progress(Stage::Finishing, None);
         merge_into(&root, target)?;
@@ -104,6 +153,94 @@ pub fn install(
 
     let _ = std::fs::remove_dir_all(&staging);
     result
+}
+
+// ---------------------------------------------------------------------------
+// The mod's own artwork
+// ---------------------------------------------------------------------------
+
+/// What a mod's banner image is called, in any letter case.
+const BANNER_NAMES: &[&str] = &["banner.png", "banner.jpg", "banner.jpeg"];
+
+/// Is `path` a banner: the right name, and an image that can be read?
+pub fn is_banner(path: &Path) -> bool {
+    let name = gfs::file_name_of(path);
+    BANNER_NAMES.iter().any(|b| name.eq_ignore_ascii_case(b)) && image_size(path).is_some()
+}
+
+/// Is `path` a `.bmp` that can be read?
+pub fn is_bitmap(path: &Path) -> bool {
+    gfs::extension_of(path) == "bmp" && image_size(path).is_some()
+}
+
+/// Width times height, for an image file that can be read.
+fn image_size(path: &Path) -> Option<u64> {
+    if !path.is_file() {
+        return None;
+    }
+    image::image_dimensions(path).ok().map(|(w, h)| u64::from(w) * u64::from(h))
+}
+
+/// The folders searched for artwork: `root`, which mirrors the game folder,
+/// then each wrapper folder above it, up to `top`.
+fn artwork_folders<'a>(root: &'a Path, top: &'a Path) -> impl Iterator<Item = &'a Path> {
+    root.ancestors().take_while(move |dir| dir.starts_with(top))
+}
+
+/// The banner shipped with a mod. The nearest to the game files wins.
+pub fn find_banner(root: &Path, top: &Path) -> Option<PathBuf> {
+    artwork_folders(root, top)
+        .find_map(|dir| files_in(dir).into_iter().filter(|f| is_banner(f)).min())
+}
+
+/// A bitmap shipped with a mod, for when it has no banner: the nearest to
+/// the game files, and of several there, the largest.
+pub fn find_bitmap(root: &Path, top: &Path) -> Option<PathBuf> {
+    artwork_folders(root, top).find_map(|dir| {
+        let mut bitmaps: Vec<(u64, PathBuf)> = files_in(dir)
+            .into_iter()
+            .filter(|f| gfs::extension_of(f) == "bmp")
+            .filter_map(|f| image_size(&f).map(|size| (size, f)))
+            .collect();
+        // Largest first; the name settles a tie, so the choice is stable.
+        bitmaps.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        bitmaps.into_iter().next().map(|(_, f)| f)
+    })
+}
+
+/// The picture for a mod's card, from its unpacked files: its banner, or else
+/// a bitmap it ships. A banner is made for the launcher alone, so it is also
+/// taken out of the files linked into the game folder; a bitmap may be a game
+/// file and stays.
+pub fn take_artwork(root: &Path, top: &Path) -> Option<Artwork> {
+    if let Some(banner) = find_banner(root, top) {
+        match Artwork::read(ArtworkKind::Banner, &banner) {
+            Ok(artwork) => {
+                let _ = std::fs::remove_file(&banner);
+                return Some(artwork);
+            }
+            Err(e) => log::warn!("could not read the banner {}: {e}", banner.display()),
+        }
+    }
+    let bitmap = find_bitmap(root, top)?;
+    Artwork::read(ArtworkKind::Bitmap, &bitmap)
+        .inspect_err(|e| log::warn!("could not read {}: {e}", bitmap.display()))
+        .ok()
+}
+
+/// Write a mod's card picture to where the launcher shows it from, replacing
+/// any picture already there.
+pub fn save_artwork(bytes: &[u8], target: &Path) -> std::io::Result<()> {
+    if let Some(folder) = target.parent() {
+        std::fs::create_dir_all(folder)?;
+    }
+    let _ = std::fs::remove_file(target);
+    std::fs::write(target, bytes)
+}
+
+/// Copy an image file to where the launcher shows a mod's card picture from.
+pub fn save_banner(source: &Path, target: &Path) -> std::io::Result<()> {
+    save_artwork(&std::fs::read(source)?, target)
 }
 
 // ---------------------------------------------------------------------------
@@ -469,7 +606,7 @@ mod tests {
         let started = std::time::Instant::now();
         // One line per stage and per ten percent, so the progress is visible.
         let last = std::cell::Cell::new((0usize, -1i32));
-        let report = install(&archive_path, &out, game, &|stage, fraction| {
+        let report = install(&archive_path, &out, game, true, &|stage, fraction| {
             let tenth = fraction.map_or(-1, |f| (f * 10.0) as i32);
             if last.get() != (stage.number(), tenth) {
                 last.set((stage.number(), tenth));
@@ -493,6 +630,10 @@ mod tests {
             report.skipped_files,
             report.skipped_bytes as f64 / 1e9,
         );
+        match &report.artwork {
+            Some(art) => println!("card artwork: {:?}, {} bytes", art.kind, art.bytes.len()),
+            None => println!("card artwork: none, the stock picture stays"),
+        }
         let mut top: Vec<String> = fs::read_dir(&out)
             .unwrap()
             .flatten()
@@ -629,5 +770,128 @@ mod tests {
         assert_eq!(fs::read(dir.join("to/Data/old.ini")).unwrap(), b"old");
         assert_eq!(fs::read(dir.join("to/both.gib")).unwrap(), b"incoming");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A small real image, so it passes the "can be read" check.
+    /// Its format follows the extension; PNG when there is none, as for the
+    /// launcher's own artwork files.
+    pub fn write_image(path: PathBuf, width: u32) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let format = image::ImageFormat::from_path(&path).unwrap_or(image::ImageFormat::Png);
+        image::RgbImage::new(width, 2).save_with_format(path, format).unwrap();
+    }
+
+    #[test]
+    fn the_banner_nearest_the_game_files_is_found() {
+        let dir = scratch("banner-find");
+        let root = dir.join("My Mod/files");
+        touch(root.join("!Mod.big"));
+        write_image(dir.join("banner.jpg"), 10);
+        write_image(dir.join("My Mod/Banner.PNG"), 20);
+
+        // In a wrapper folder, whatever its letter case.
+        assert_eq!(find_banner(&root, &dir), Some(dir.join("My Mod/Banner.PNG")));
+        // Nothing above `top` is looked at.
+        assert_eq!(find_banner(&root, &root), None);
+
+        // Beside the game files beats any wrapper.
+        write_image(root.join("BANNER.jpeg"), 30);
+        assert_eq!(find_banner(&root, &dir), Some(root.join("BANNER.jpeg")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_readable_image_by_that_name_is_a_banner() {
+        let dir = scratch("banner-not");
+        touch(dir.join("!Mod.big"));
+        // Named right but not an image; an image under another name; and a
+        // banner deeper than the game files, which is the mod's own business.
+        fs::write(dir.join("banner.png"), b"not an image").unwrap();
+        write_image(dir.join("logo.png"), 10);
+        write_image(dir.join("Art/banner.png"), 10);
+
+        assert_eq!(find_banner(&dir, &dir), None);
+        assert!(!is_banner(&dir.join("banner.png")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_banner_is_taken_out_of_the_mod_and_beats_any_bitmap() {
+        let dir = scratch("banner-take");
+        let root = dir.join("staging");
+        touch(root.join("!Mod.big"));
+        write_image(root.join("banner.png"), 50);
+        write_image(root.join("Install_Final.bmp"), 400);
+        let shipped = fs::read(root.join("banner.png")).unwrap();
+
+        let artwork = take_artwork(&root, &root).unwrap();
+
+        assert_eq!(artwork, Artwork { kind: ArtworkKind::Banner, bytes: shipped });
+        assert!(!root.join("banner.png").exists(), "the banner would be linked into the game folder");
+        assert!(root.join("Install_Final.bmp").exists());
+        assert!(root.join("!Mod.big").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn without_a_banner_the_largest_nearest_bitmap_is_used_and_stays_in_the_mod() {
+        let dir = scratch("banner-bitmap");
+        let root = dir.join("Wrapper/files");
+        touch(root.join("!Mod.big"));
+        // The wrapper's bitmap is the biggest, but the one beside the game
+        // files is nearer; there, the larger of two wins.
+        write_image(dir.join("Wrapper/huge.bmp"), 900);
+        write_image(root.join("Install_Final.bmp"), 300);
+        write_image(root.join("small.bmp"), 20);
+        // Not a bitmap, and a bitmap that cannot be read.
+        write_image(root.join("logo.png"), 999);
+        fs::write(root.join("broken.bmp"), b"not an image").unwrap();
+
+        let artwork = take_artwork(&root, &dir).unwrap();
+
+        assert_eq!(artwork.kind, ArtworkKind::Bitmap);
+        assert_eq!(artwork.bytes, fs::read(root.join("Install_Final.bmp")).unwrap());
+        assert!(root.join("Install_Final.bmp").exists(), "a bitmap may be a game file");
+
+        // With none beside the game files, a wrapper's will do.
+        for f in ["Install_Final.bmp", "small.bmp", "broken.bmp"] {
+            fs::remove_file(root.join(f)).unwrap();
+        }
+        let artwork = take_artwork(&root, &dir).unwrap();
+        assert_eq!(artwork.bytes, fs::read(dir.join("Wrapper/huge.bmp")).unwrap());
+
+        // And with nothing at all, there is no artwork: the card keeps its
+        // stock picture.
+        fs::remove_file(dir.join("Wrapper/huge.bmp")).unwrap();
+        assert_eq!(take_artwork(&root, &dir), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_artwork_replaces_what_was_there() {
+        let dir = scratch("banner-save");
+        let target = dir.join("LauncherImages/My Mod/1.0");
+        write_image(target.clone(), 7);
+        save_artwork(b"new", &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_banner_found_later_beats_a_bitmap_found_first_but_not_another_banner() {
+        let art = |kind, byte| Some(Artwork { kind, bytes: vec![byte] });
+        let report = |artwork| InstallReport { artwork, ..Default::default() };
+
+        let mut all = InstallReport::default();
+        all.merge(&report(art(ArtworkKind::Bitmap, 1)));
+        all.merge(&report(art(ArtworkKind::Bitmap, 2)));
+        assert_eq!(all.artwork, art(ArtworkKind::Bitmap, 1));
+        assert!(!all.has_banner());
+
+        all.merge(&report(art(ArtworkKind::Banner, 3)));
+        all.merge(&report(None));
+        all.merge(&report(art(ArtworkKind::Banner, 4)));
+        assert_eq!(all.artwork, art(ArtworkKind::Banner, 3));
+        assert!(all.has_banner());
     }
 }

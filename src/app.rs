@@ -471,9 +471,13 @@ impl GenLauncherApp {
                 self.add_progress = Some(AddProgress { label, fraction });
             }
 
-            Bg::ManualAddDone { error, archives, report } => {
+            Bg::ManualAddDone { error, archives, report, banner } => {
                 self.busy = false;
                 self.add_progress = None;
+                // Replacing the artwork of a version added before.
+                if let Some(banner) = banner {
+                    self.images.invalidate(&banner);
+                }
                 self.store.refresh_local_modifications();
                 self.renumber_mods();
                 if let Some(error) = error {

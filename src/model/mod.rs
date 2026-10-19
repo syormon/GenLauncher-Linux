@@ -352,6 +352,14 @@ impl GameModification {
         self.latest.union(version);
     }
 
+    /// True when the launcher has nowhere to download any version from: the
+    /// user added it from their own files.
+    pub fn is_user_added(&self) -> bool {
+        !self.versions.iter().any(|v| {
+            !v.info.simple_download_link.is_empty() || !v.info.s3_folder_name.is_empty()
+        })
+    }
+
     /// Versions ordered oldest to newest, as `OrderBy(m => m)` does in C#.
     pub fn versions_ordered(&self) -> Vec<&ModVersion> {
         let mut v: Vec<&ModVersion> = self.versions.iter().collect();

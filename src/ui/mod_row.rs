@@ -11,7 +11,6 @@ use crate::i18n;
 use crate::model::colors::Palette;
 use crate::model::{EngineChoice, GameModification, ModificationType};
 use crate::ui::theme;
-use crate::util::fs as gfs;
 
 /// What the user did on a row this frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,11 +105,15 @@ pub fn mod_row(
                 ui.vertical_centered(|ui| {
                     let border =
                         if ctx.selected { palette.active } else { palette.inactive_border };
-                    // Stroke the image's own rect so the outline hugs the banner
-                    // instead of stretching across the whole card.
-                    let image = ui.add(egui::Image::new(&texture).fit_to_exact_size(size));
+                    // The whole picture at its own proportions, centred on dark
+                    // bars: a mod's own artwork is rarely exactly 500x100.
+                    let (frame, _) = ui.allocate_exact_size(size, Sense::hover());
+                    ui.painter().rect_filled(frame, 2, palette.dark_background);
+                    egui::Image::new(&texture).paint_at(ui, letterbox(texture.size_vec2(), frame));
+                    // Stroke the frame so the outline hugs the banner instead of
+                    // stretching across the whole card.
                     ui.painter().rect_stroke(
-                        image.rect,
+                        frame,
                         2,
                         egui::Stroke::new(1.0_f32, border),
                         egui::StrokeKind::Outside,
@@ -332,7 +335,12 @@ fn latest_version_label(modification: &GameModification) -> String {
         .latest_version()
         .map(|v| v.version().to_owned())
         .unwrap_or_default();
-    format!("{}{version}", i18n::tr("LatestVersion"))
+    let mut label = format!("{}{version}", i18n::tr("LatestVersion"));
+    if modification.kind() == ModificationType::Mod && modification.is_user_added() {
+        label.push(' ');
+        label.push_str(&i18n::tr("UserAddedMod"));
+    }
+    label
 }
 
 const VERSION_PICKER_WIDTH: f32 = 190.0;
@@ -398,9 +406,7 @@ fn update_button(
     let latest_installed =
         modification.latest_version().map(|v| v.installed).unwrap_or(false);
     let nothing_installed = !modification.versions.iter().any(|v| v.installed);
-    let can_fetch = modification.versions.iter().any(|v| {
-        !v.info.simple_download_link.is_empty() || !v.info.s3_folder_name.is_empty()
-    });
+    let can_fetch = !modification.is_user_added();
 
     let label = if downloading {
         i18n::tr("Stop")
@@ -491,6 +497,16 @@ fn context_menu(
     action
 }
 
+/// Where a picture of `image` size goes in `frame`: as large as fits whole,
+/// at its own proportions, centred.
+fn letterbox(image: Vec2, frame: egui::Rect) -> egui::Rect {
+    if image.x <= 0.0 || image.y <= 0.0 {
+        return frame;
+    }
+    let scale = (frame.width() / image.x).min(frame.height() / image.y);
+    egui::Rect::from_center_size(frame.center(), image * scale)
+}
+
 /// Pick the artwork for a row: the mod's own banner, or the stock placeholder.
 fn artwork(
     ctx: &egui::Context,
@@ -503,10 +519,7 @@ fn artwork(
     match modification.kind() {
         ModificationType::Mod => {
             let latest = modification.latest_version()?;
-            let own = config::game_path(config::LAUNCHER_FOLDER)
-                .join(config::LAUNCHER_IMAGE_SUBFOLDER)
-                .join(gfs::sanitize_file_name(modification.name()))
-                .join(latest.version());
+            let own = config::mod_image_path(modification.name(), latest.version());
 
             let path = if own.is_file() {
                 own
@@ -621,6 +634,53 @@ mod tests {
                 .1
         };
         Drawn { card, name: find(name), picker_text: find(version), all }
+    }
+
+    #[test]
+    fn artwork_is_letterboxed_not_stretched() {
+        let frame = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), Vec2::new(500.0, 100.0));
+
+        // Exactly 5:1 fills the frame.
+        assert_eq!(letterbox(Vec2::new(1000.0, 200.0), frame), frame);
+
+        // A 4:3 splash keeps its shape: full height, centred, bars either side.
+        let splash = letterbox(Vec2::new(800.0, 600.0), frame);
+        assert!((splash.width() - 100.0 * 4.0 / 3.0).abs() < 0.01, "{:?}", splash.size());
+        assert_eq!(splash.height(), 100.0);
+        assert_eq!(splash.center(), frame.center());
+
+        // Wider than 5:1: full width, bars above and below.
+        let strip = letterbox(Vec2::new(1000.0, 100.0), frame);
+        assert_eq!(strip.size(), Vec2::new(500.0, 50.0));
+        assert_eq!(strip.center(), frame.center());
+
+        // A small picture is scaled up to fit too.
+        assert_eq!(letterbox(Vec2::new(50.0, 10.0), frame), frame);
+    }
+
+    #[test]
+    fn only_a_mod_with_nowhere_to_download_from_is_labelled_user_added() {
+        let version = |kind, link: &str| ModVersion {
+            info: ReposVersion {
+                name: "Contra".to_owned(),
+                version: "009".to_owned(),
+                modification_type: kind,
+                simple_download_link: link.to_owned(),
+                ..Default::default()
+            },
+            installed: true,
+            ..Default::default()
+        };
+        let label = |v: &ModVersion| latest_version_label(&GameModification::new(v));
+        let marker = i18n::tr("UserAddedMod");
+
+        let added = label(&version(ModificationType::Mod, ""));
+        assert!(added.contains("009") && added.ends_with(&marker), "{added:?}");
+        let listed = label(&version(ModificationType::Mod, "https://example.com/contra.zip"));
+        assert!(!listed.contains(&marker), "{listed:?}");
+        // Patches and addons are not mods.
+        let addon = label(&version(ModificationType::Addon, ""));
+        assert!(!addon.contains(&marker), "{addon:?}");
     }
 
     const LONG_NAME: &str = "Generals Project Raptor War Commanders Extended Edition";

@@ -36,8 +36,14 @@ pub enum Bg {
     ManualAddProgress { label: String, fraction: Option<f32> },
     /// Files were unpacked into the mod store by hand; rescan is needed.
     /// `archives` are the archives that were installed, so the user can be
-    /// offered their deletion; it is empty when the install failed.
-    ManualAddDone { error: Option<String>, archives: Vec<PathBuf>, report: InstallReport },
+    /// offered their deletion; it is empty when the install failed. `banner`
+    /// is where the mod's own banner was saved, if it brought one.
+    ManualAddDone {
+        error: Option<String>,
+        archives: Vec<PathBuf>,
+        report: InstallReport,
+        banner: Option<PathBuf>,
+    },
     /// Progress of the side-bar download (the Vulkan layer).
     SideProgress { label: String, total: Option<u64>, read: u64 },
     /// The side-bar download finished.
@@ -839,10 +845,13 @@ fn verify_mod_files(
 }
 
 /// Install the files the user picked into the mod store, unpacking archives.
+/// With `banner_target`, a banner image among them is saved there as the
+/// mod's artwork.
 pub fn spawn_manual_add(
     runtime: &tokio::runtime::Runtime,
     files: Vec<PathBuf>,
     target_relative: String,
+    banner_target: Option<PathBuf>,
     game: Game,
     tx: Sender<Bg>,
 ) {
@@ -861,19 +870,21 @@ pub fn spawn_manual_add(
             }
         };
 
-        let message = match install_files(&files, &target, game, &progress) {
+        let message = match install_files(&files, &target, game, banner_target.as_deref(), &progress) {
             Ok(report) => Bg::ManualAddDone {
                 error: None,
                 archives: files
                     .into_iter()
                     .filter(|f| crate::util::archive::is_supported_archive(f))
                     .collect(),
+                banner: banner_target.filter(|_| report.artwork.is_some()),
                 report,
             },
             Err(e) => Bg::ManualAddDone {
                 error: Some(format!("{e:#}")),
                 archives: Vec::new(),
                 report: InstallReport::default(),
+                banner: None,
             },
         };
         let _ = tx.send(message);
@@ -882,13 +893,20 @@ pub fn spawn_manual_add(
 
 /// Port of `ModificationsFileHandler.ExtractModificationFromFiles`. Archives
 /// are unpacked straight from where they are, never copied first.
+///
+/// With `banner_target`, the mod's card picture is saved there: the first
+/// banner image found, in an archive or picked directly, which is not
+/// installed with the mod. Without a banner, the first bitmap found is used
+/// instead, and is installed as well. Without either, nothing is saved and
+/// the card keeps the stock picture.
 fn install_files(
     files: &[PathBuf],
     target: &std::path::Path,
     game: Game,
+    banner_target: Option<&std::path::Path>,
     progress: &dyn Fn(String, Option<f32>),
 ) -> anyhow::Result<InstallReport> {
-    use game::mod_archive::Stage;
+    use game::mod_archive::{Artwork, ArtworkKind, Stage};
 
     let mut report = InstallReport::default();
 
@@ -899,6 +917,14 @@ fn install_files(
         } else {
             String::new()
         };
+        // Only until a banner turns up: nothing beats the first one.
+        let want_artwork = banner_target.is_some() && !report.has_banner();
+
+        if want_artwork && game::mod_archive::is_banner(file) {
+            progress(format!("{which}{}", gfs::file_name_of(file)), None);
+            report.offer(Some(Artwork::read(ArtworkKind::Banner, file)?));
+            continue;
+        }
 
         if crate::util::archive::is_supported_archive(file) {
             let staged = |stage: Stage, fraction: Option<f32>| {
@@ -907,8 +933,12 @@ fn install_files(
                     fraction,
                 );
             };
-            report.merge(&game::mod_archive::install(file, target, game, &staged)?);
+            report.merge(&game::mod_archive::install(file, target, game, want_artwork, &staged)?);
             continue;
+        }
+
+        if want_artwork && game::mod_archive::is_bitmap(file) {
+            report.offer(Some(Artwork::read(ArtworkKind::Bitmap, file)?));
         }
 
         progress(format!("{which}{}", gfs::file_name_of(file)), None);
@@ -924,5 +954,89 @@ fn install_files(
             gfs::move_file(&copied, &gib)?;
         }
     }
+
+    if let (Some(to), Some(artwork)) = (banner_target, &report.artwork) {
+        // The mod is in; a picture that cannot be saved only costs the card
+        // its artwork.
+        if let Err(e) = game::mod_archive::save_artwork(&artwork.bytes, to) {
+            log::warn!("could not save the mod's picture to {}: {e}", to.display());
+            report.artwork = None;
+        }
+    }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn a_picked_banner_becomes_the_artwork_not_a_mod_file() {
+        let dir = std::env::temp_dir().join(format!("gl-tasks-banner-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let picked = dir.join("picked");
+        fs::create_dir_all(&picked).unwrap();
+        fs::write(picked.join("!Mod.big"), b"BIGF").unwrap();
+        image::RgbImage::new(10, 2).save(picked.join("Banner.png")).unwrap();
+        image::RgbImage::new(20, 4).save(picked.join("banner.jpg")).unwrap();
+
+        let target = dir.join("GLM/My Mod/1.0");
+        let artwork = dir.join("LauncherImages/My Mod/1.0");
+        let files = vec![picked.join("Banner.png"), picked.join("!Mod.big"), picked.join("banner.jpg")];
+        let report = install_files(&files, &target, Game::ZeroHour, Some(&artwork), &|_, _| {}).unwrap();
+
+        assert!(report.has_banner());
+        // The first banner picked wins; the second is installed like any file.
+        assert_eq!(fs::read(&artwork).unwrap(), fs::read(picked.join("Banner.png")).unwrap());
+        assert!(!target.join("Banner.png").exists());
+        assert!(target.join("banner.jpg").exists());
+        assert!(target.join("!Mod.gib").exists());
+        // The user's own files are left where they were.
+        assert!(picked.join("Banner.png").exists());
+
+        // Without a place for artwork (a patch or addon), it is just a file.
+        let addon = dir.join("GLM/My Mod/Addons/HUD/1.0");
+        let report = install_files(&files[..1], &addon, Game::ZeroHour, None, &|_, _| {}).unwrap();
+        assert!(report.artwork.is_none());
+        assert!(addon.join("Banner.png").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_picked_bitmap_is_the_artwork_only_without_a_banner() {
+        let dir = std::env::temp_dir().join(format!("gl-tasks-bitmap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let picked = dir.join("picked");
+        fs::create_dir_all(&picked).unwrap();
+        fs::write(picked.join("!Mod.big"), b"BIGF").unwrap();
+        image::RgbImage::new(30, 20).save(picked.join("Install_Final.bmp")).unwrap();
+        image::RgbImage::new(10, 2).save(picked.join("banner.png")).unwrap();
+        let bitmap = picked.join("Install_Final.bmp");
+        let banner = picked.join("banner.png");
+
+        // A bitmap alone is used, and still installed: it may be a game file.
+        let target = dir.join("GLM/A/1.0");
+        let artwork = dir.join("LauncherImages/A/1.0");
+        install_files(&[bitmap.clone(), picked.join("!Mod.big")], &target, Game::ZeroHour, Some(&artwork), &|_, _| {})
+            .unwrap();
+        assert_eq!(fs::read(&artwork).unwrap(), fs::read(&bitmap).unwrap());
+        assert!(target.join("Install_Final.bmp").exists());
+
+        // A banner picked after it still wins.
+        let target = dir.join("GLM/B/1.0");
+        let artwork = dir.join("LauncherImages/B/1.0");
+        install_files(&[bitmap.clone(), banner.clone()], &target, Game::ZeroHour, Some(&artwork), &|_, _| {})
+            .unwrap();
+        assert_eq!(fs::read(&artwork).unwrap(), fs::read(&banner).unwrap());
+
+        // Neither: nothing is saved, so the card keeps the stock picture.
+        let target = dir.join("GLM/C/1.0");
+        let artwork = dir.join("LauncherImages/C/1.0");
+        let report =
+            install_files(&[picked.join("!Mod.big")], &target, Game::ZeroHour, Some(&artwork), &|_, _| {}).unwrap();
+        assert!(report.artwork.is_none());
+        assert!(!artwork.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

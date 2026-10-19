@@ -99,6 +99,15 @@ pub fn game_path(rel: impl AsRef<Path>) -> PathBuf {
     }
 }
 
+/// Where a mod version's 500x100 banner is kept. Stored without an extension:
+/// the format is sniffed when the banner is shown.
+pub fn mod_image_path(name: &str, version: &str) -> PathBuf {
+    game_path(LAUNCHER_FOLDER)
+        .join(LAUNCHER_IMAGE_SUBFOLDER)
+        .join(crate::util::fs::sanitize_file_name(name))
+        .join(version)
+}
+
 /// Directory holding the user's Options.ini, Replays and Maps for `game`.
 ///
 /// Under Proton the game writes into the prefix's Documents folder
