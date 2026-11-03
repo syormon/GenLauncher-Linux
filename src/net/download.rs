@@ -27,7 +27,10 @@ use crate::util::{archive, fs as gfs, links, md5_file};
 
 /// Give up on a transfer that has not produced a byte for this long.
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Reconnects in a row without getting any further, before giving up.
 const CONNECTION_ATTEMPTS: u32 = 5;
+/// The wait between reconnects doubles from 2 seconds up to this.
+const LONGEST_RETRY_WAIT: Duration = Duration::from_secs(30);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(120);
 
 /// Identifies the list row a download belongs to.
@@ -167,31 +170,14 @@ pub async fn http_single_file(
     let mut progress = Progress::new(key.clone(), tx.clone());
     progress.message(i18n::tr("Preparing"));
 
-    let mut attempt = 0u32;
+    let mut retries = Retries::default();
     loop {
-        match http_single_file_once(&version, &mut progress, &cancel).await {
+        let error = match http_single_file_once(&version, &mut progress, &cancel).await {
             Ok(result) => return result,
-            Err(e) if is_transient(&e) && attempt < CONNECTION_ATTEMPTS => {
-                attempt += 1;
-                progress.message(format!(
-                    "Connection timed out. Trying to reastablish connection... attempt: {attempt}"
-                ));
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-            Err(e) if is_transient(&e) => {
-                return DownloadResult {
-                    timed_out: true,
-                    message: "Connection timed out. Unable to establish a new connection".into(),
-                    ..Default::default()
-                }
-            }
-            Err(e) => {
-                return DownloadResult {
-                    crashed: true,
-                    message: format!("{e:#}"),
-                    ..Default::default()
-                }
-            }
+            Err(error) => error,
+        };
+        if let Some(result) = after_failure(error, &mut retries, &progress, &cancel).await {
+            return result;
         }
     }
 }
@@ -348,33 +334,16 @@ pub async fn s3_multi_file(
     let mut progress = Progress::new(key.clone(), tx.clone());
     progress.message(i18n::tr("Preparing"));
 
-    let mut attempt = 0u32;
+    let mut retries = Retries::default();
     loop {
-        match s3_multi_file_once(&version, previous_version_folder.as_deref(), &mut progress, &cancel)
-            .await
-        {
+        let attempt =
+            s3_multi_file_once(&version, previous_version_folder.as_deref(), &mut progress, &cancel);
+        let error = match attempt.await {
             Ok(result) => return result,
-            Err(e) if is_transient(&e) && attempt < CONNECTION_ATTEMPTS => {
-                attempt += 1;
-                progress.message(format!(
-                    "Connection timed out. Trying to reastablish connection... attempt: {attempt}"
-                ));
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-            Err(e) if is_transient(&e) => {
-                return DownloadResult {
-                    timed_out: true,
-                    message: "Connection timed out. Unable to establish a new connection".into(),
-                    ..Default::default()
-                }
-            }
-            Err(e) => {
-                return DownloadResult {
-                    crashed: true,
-                    message: format!("{e:#}"),
-                    ..Default::default()
-                }
-            }
+            Err(error) => error,
+        };
+        if let Some(result) = after_failure(error, &mut retries, &progress, &cancel).await {
+            return result;
         }
     }
 }
@@ -617,10 +586,16 @@ async fn stream_to_file(
 
         let next = tokio::time::timeout(STALL_TIMEOUT, stream.next()).await;
         let chunk = match next {
-            Err(_) => bail!(TransientError),
+            // Flushed either way: the next attempt resumes from the file's size.
+            Err(_) => {
+                file.flush().await?;
+                bail!(TransientError);
+            }
             Ok(None) => break,
-            Ok(Some(Err(e))) if e.is_timeout() || e.is_connect() => bail!(TransientError),
-            Ok(Some(Err(e))) => return Err(e).context("reading download stream"),
+            Ok(Some(Err(e))) => {
+                file.flush().await?;
+                return Err(e).context("reading download stream");
+            }
             Ok(Some(Ok(chunk))) => chunk,
         };
 
@@ -636,15 +611,97 @@ async fn stream_to_file(
 
 /// Marker for "the connection stalled, retrying is worthwhile".
 #[derive(Debug, thiserror::Error)]
-#[error("connection timed out")]
+#[error("connection stalled")]
 struct TransientError;
 
+/// Is this a connection failing, which trying again may cure? Besides timeouts
+/// and failed connects, that is a connection dropped once it was open: reqwest
+/// reports one as a request error while sending, and as a body or decode error
+/// partway through a file. Its other errors, such as an HTTP status, are not
+/// about the connection.
 fn is_transient(error: &anyhow::Error) -> bool {
     error.downcast_ref::<TransientError>().is_some()
-        || error
-            .downcast_ref::<reqwest::Error>()
-            .map(|e| e.is_timeout() || e.is_connect())
-            .unwrap_or(false)
+        || error.downcast_ref::<reqwest::Error>().is_some_and(|e| {
+            e.is_timeout() || e.is_connect() || e.is_request() || e.is_body() || e.is_decode()
+        })
+}
+
+/// Counts reconnects. Only attempts that got nowhere use them up, so a long
+/// install on a flaky connection can lose it any number of times: everything
+/// already downloaded is kept, and each attempt continues from there.
+#[derive(Debug, Default)]
+struct Retries {
+    used: u32,
+    /// The most bytes any attempt has got to.
+    furthest: u64,
+}
+
+impl Retries {
+    /// After losing the connection with `read` bytes in hand: which attempt
+    /// comes next and how long to wait for it, or `None` to give up.
+    fn next(&mut self, read: u64) -> Option<(u32, Duration)> {
+        if read > self.furthest {
+            self.furthest = read;
+            self.used = 0;
+        }
+        if self.used >= CONNECTION_ATTEMPTS {
+            return None;
+        }
+        self.used += 1;
+        let wait = Duration::from_secs(2u64.pow(self.used)).min(LONGEST_RETRY_WAIT);
+        Some((self.used, wait))
+    }
+}
+
+/// What to do about a failed attempt: `None` once it is time to try again, or
+/// the result the download ends with.
+async fn after_failure(
+    error: anyhow::Error,
+    retries: &mut Retries,
+    progress: &Progress,
+    cancel: &Cancel,
+) -> Option<DownloadResult> {
+    if !is_transient(&error) {
+        return Some(DownloadResult {
+            crashed: true,
+            message: format!("{error:#}"),
+            ..Default::default()
+        });
+    }
+
+    log::warn!("download interrupted: {error:#}");
+    let Some((attempt, wait)) = retries.next(progress.read) else {
+        return Some(DownloadResult {
+            timed_out: true,
+            message: i18n::tr("ConnectionGaveUp"),
+            ..Default::default()
+        });
+    };
+
+    progress.message(i18n::trf(
+        "ConnectionRetrying",
+        &[&wait.as_secs().to_string(), &attempt.to_string(), &CONNECTION_ATTEMPTS.to_string()],
+    ));
+    if !wait_unless_cancelled(wait, cancel).await {
+        return Some(cancelled());
+    }
+    progress.message(i18n::tr("Preparing"));
+    None
+}
+
+/// Sleep for `wait`, or until the user stops the download. False if they did.
+async fn wait_unless_cancelled(wait: Duration, cancel: &Cancel) -> bool {
+    const CHECK_EVERY: Duration = Duration::from_millis(200);
+
+    let deadline = Instant::now() + wait;
+    while !cancel.is_cancelled() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        tokio::time::sleep(left.min(CHECK_EVERY)).await;
+    }
+    false
 }
 
 fn cancelled() -> DownloadResult {
@@ -818,6 +875,284 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&staging);
+    }
+
+    // -- losing the connection ---------------------------------------------
+
+    /// What a test server does with one connection.
+    struct Reply {
+        bytes: Vec<u8>,
+        /// Cut the connection with a reset, rather than closing it normally.
+        reset: bool,
+    }
+
+    /// Serves one request per connection, as `plan` says from the connection's
+    /// number and the request's text. Returns the server's address.
+    async fn test_server(
+        plan: impl Fn(usize, &str) -> Reply + Send + Sync + 'static,
+    ) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let plan = Arc::new(plan);
+
+        tokio::spawn(async move {
+            let mut connections = 0..;
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let number = connections.next().expect("an endless count");
+                let plan = plan.clone();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4096];
+                    let length = socket.read(&mut request).await.unwrap_or(0);
+                    let reply = plan(number, &String::from_utf8_lossy(&request[..length]));
+                    let _ = socket.write_all(&reply.bytes).await;
+                    if reply.reset {
+                        // Let the bytes arrive before the reset discards them.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        socket.set_zero_linger().unwrap();
+                    }
+                });
+            }
+        });
+        address
+    }
+
+    fn headers(status: &str, length: usize) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {length}\r\n\
+             Content-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn progress() -> Progress {
+        Progress::new(ModKey::new(ModificationType::Mod, "test"), std::sync::mpsc::channel().0)
+    }
+
+    fn scratch_file(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("gl-download-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    /// Stream a reply that breaks off after `"partial"`, into `path`.
+    async fn stream_cut_off_body(path: &Path, reset: bool) -> anyhow::Error {
+        let url = test_server(move |_, _| Reply {
+            bytes: [headers("200 OK", 1000), b"partial".to_vec()].concat(),
+            reset,
+        })
+        .await;
+        let response = reqwest::Client::new().get(url).send().await.unwrap();
+        let file = tokio::fs::File::create(path).await.unwrap();
+
+        stream_to_file(response, file, &mut progress(), &Cancel::new(), None)
+            .await
+            .expect_err("the body was cut off")
+    }
+
+    #[tokio::test]
+    async fn a_reset_before_any_reply_is_worth_retrying() {
+        let url = test_server(|_, _| Reply { bytes: Vec::new(), reset: true }).await;
+
+        let error = reqwest::Client::new().get(url).send().await.unwrap_err();
+
+        assert!(is_transient(&error.into()));
+    }
+
+    #[tokio::test]
+    async fn a_connection_lost_partway_through_a_file_is_worth_retrying() {
+        for (name, reset) in [("reset", true), ("closed", false)] {
+            let path = scratch_file(name);
+
+            let error = stream_cut_off_body(&path, reset).await;
+
+            assert!(is_transient(&error), "{name}: {error:#}");
+            // The next attempt resumes from the size of what was written.
+            assert_eq!(std::fs::read(&path).unwrap(), b"partial", "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_http_error_is_not_a_connection_problem() {
+        let url =
+            test_server(|_, _| Reply { bytes: headers("404 Not Found", 0), reset: false }).await;
+
+        let response = reqwest::Client::new().get(url).send().await.unwrap();
+        let error = response.error_for_status().unwrap_err();
+
+        assert!(!is_transient(&error.into()));
+        assert!(!is_transient(&anyhow::anyhow!("the disk is full")));
+    }
+
+    #[test]
+    fn retries_wait_longer_each_time_then_give_up() {
+        let mut retries = Retries::default();
+        let waits: Vec<u64> = (0..CONNECTION_ATTEMPTS)
+            .map(|_| retries.next(0).expect("attempts left").1.as_secs())
+            .collect();
+
+        assert_eq!(waits, [2, 4, 8, 16, 30]);
+        assert_eq!(retries.next(0), None);
+    }
+
+    #[test]
+    fn any_progress_earns_a_fresh_set_of_retries() {
+        let mut retries = Retries::default();
+        for read in [100, 100, 100] {
+            retries.next(read).unwrap();
+        }
+        assert_eq!(retries.next(100).unwrap().0, 4, "no further on: the count goes on");
+
+        // Further than ever: back to the first attempt and the shortest wait.
+        assert_eq!(retries.next(101), Some((1, Duration::from_secs(2))));
+        // Falling short of that later is not progress.
+        assert_eq!(retries.next(50).unwrap().0, 2);
+    }
+
+    #[tokio::test]
+    async fn only_connection_failures_are_retried() {
+        let result = after_failure(
+            anyhow::anyhow!("the disk is full"),
+            &mut Retries::default(),
+            &progress(),
+            &Cancel::new(),
+        )
+        .await
+        .expect("no retry");
+
+        assert!(result.crashed);
+        assert_eq!(result.message, "the disk is full");
+    }
+
+    #[tokio::test]
+    async fn running_out_of_retries_says_what_to_do() {
+        let mut spent = Retries { used: CONNECTION_ATTEMPTS, furthest: 0 };
+
+        let result =
+            after_failure(TransientError.into(), &mut spent, &progress(), &Cancel::new())
+                .await
+                .expect("no retry");
+
+        assert!(result.timed_out && !result.crashed);
+        assert_eq!(result.message, i18n::tr("ConnectionGaveUp"));
+    }
+
+    #[tokio::test]
+    async fn stop_works_during_the_wait_before_a_retry() {
+        // The longest wait there is, so that sitting it out would fail.
+        let mut retries = Retries { used: CONNECTION_ATTEMPTS - 1, furthest: 0 };
+        let cancel = Cancel::new();
+        let stopper = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stopper.cancel();
+        });
+
+        let started = Instant::now();
+        let result = after_failure(TransientError.into(), &mut retries, &progress(), &cancel)
+            .await
+            .expect("no retry");
+
+        assert!(result.canceled);
+        assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn the_wait_before_a_retry_runs_its_course() {
+        let started = Instant::now();
+        assert!(wait_unless_cancelled(Duration::from_millis(250), &Cancel::new()).await);
+        assert!(started.elapsed() >= Duration::from_millis(250));
+    }
+
+    /// The whole of a download through a connection that keeps failing: a
+    /// reset before any reply, then one partway through the file. It should
+    /// resume from where it broke and end up with the file intact.
+    ///
+    /// Ignored because it claims the process-wide game folder, which other
+    /// tests share. Run it alone:
+    ///
+    /// ```text
+    /// cargo test survives_losing_the_connection -- --ignored
+    /// ```
+    #[tokio::test]
+    #[ignore = "claims the process-wide game folder; run it on its own"]
+    async fn survives_losing_the_connection() {
+        use crate::model::ReposVersion;
+
+        let game = std::env::temp_dir().join(format!("gl-flaky-game-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&game);
+        std::fs::create_dir_all(&game).unwrap();
+        config::set_game_dir(game.clone());
+        assert_eq!(config::game_dir(), game, "another test claimed the game folder first");
+
+        let content: Vec<u8> = (0..100_000u32).map(|n| (n % 251) as u8).collect();
+        let served = content.clone();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = requests.clone();
+
+        let url = test_server(move |connection, request| {
+            let range = request.lines().find_map(|line| {
+                let lower = line.to_ascii_lowercase();
+                lower.strip_prefix("range: bytes=")?.strip_suffix('-')?.parse::<usize>().ok()
+            });
+            log.lock().unwrap().push(range);
+
+            if let Some(from) = range {
+                let rest = &served[from..];
+                return Reply {
+                    bytes: [headers("206 Partial Content", rest.len()), rest.to_vec()].concat(),
+                    reset: false,
+                };
+            }
+            match connection {
+                0 => Reply { bytes: Vec::new(), reset: true },
+                1 => Reply {
+                    bytes: [headers("200 OK", served.len()), served[..40_000].to_vec()].concat(),
+                    reset: true,
+                },
+                _ => Reply {
+                    bytes: [headers("200 OK", served.len()), served.clone()].concat(),
+                    reset: false,
+                },
+            }
+        })
+        .await;
+
+        let version = ModVersion {
+            info: ReposVersion {
+                name: "Flaky Mod".into(),
+                version: "1.0".into(),
+                modification_type: ModificationType::Mod,
+                simple_download_link: format!("{url}/mod.big"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let result = http_single_file(version.clone(), tx, Cancel::new()).await;
+
+        assert!(!result.crashed && !result.timed_out, "{}", result.message);
+        assert_eq!(std::fs::read(version.folder_path().join("mod.gib")).unwrap(), content);
+
+        let said: Vec<String> = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                DownloadEvent::Message { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        let retry = |wait: &str, attempt: &str| {
+            i18n::trf("ConnectionRetrying", &[wait, attempt, &CONNECTION_ATTEMPTS.to_string()])
+        };
+        assert!(said.contains(&retry("2", "1")), "{said:?}");
+        assert_eq!(said.iter().filter(|text| **text == retry("2", "1")).count(), 2, "{said:?}");
+
+        // The last request asked for just the rest of the file.
+        assert_eq!(requests.lock().unwrap().last(), Some(&Some(40_000)));
+        let _ = std::fs::remove_dir_all(&game);
     }
 }
 

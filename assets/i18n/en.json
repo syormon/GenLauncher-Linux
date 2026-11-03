@@ -16,6 +16,8 @@
  "AutoDelete": "Auto delete outdated modification versions",
  "Cancel": "Cancel",
  "Canceled": "Download canceled",
+ "ConnectionRetrying": "Connection lost. Retrying in {0}s (attempt {1} of {2})...",
+ "ConnectionGaveUp": "The connection to the download server kept dropping, so the download has stopped. Start it again to continue: what has been downloaded is kept until the launcher is closed.",
  "CannotConnect": "Cannot connect to https://github.com/, installing modifications from internet is not available!",
  "CannotFindPath": "Сannot find the folder along the path: ",
  "CantCheckGentool": "Unable to check gentool",
