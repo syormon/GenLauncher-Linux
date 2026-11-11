@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::config::{self, Game};
-use crate::model::ProtonSettings;
 
 const DEFAULT_OPTIONS: &str = include_str!("../../assets/options.ini");
 
@@ -26,10 +25,13 @@ pub const TOGGLE_KEYS: &[(&str, &str)] = &[
     ("UseAlternateMouse", "AlternateMouseSetup"),
 ];
 
+/// What the options screen offers, narrowest first. The ultrawides are
+/// 2560×1080, 3440×1440 and 3840×1600.
 pub const RESOLUTIONS: &[&str] = &[
     "1024×768", "1152×864", "1176×664", "1280×720", "1280×768", "1280×800", "1280×960",
     "1280×1024", "1360×768", "1366×768", "1440×900", "1600×900", "1600×1024", "1600×1200",
-    "1680×1050", "1920×1080", "1920×1200", "1920×1440", "2560×1440", "3620×2036",
+    "1680×1050", "1920×1080", "1920×1200", "1920×1440", "2560×1080", "2560×1440", "3440×1440",
+    "3620×2036", "3840×1600",
 ];
 
 pub struct GameOptions {
@@ -39,8 +41,8 @@ pub struct GameOptions {
 }
 
 impl GameOptions {
-    pub fn load(game: Game, proton: &ProtonSettings) -> Result<Self> {
-        let folder = config::user_data_dir(game, proton);
+    pub fn load(game: Game) -> Result<Self> {
+        let folder = config::user_data_dir(game);
         std::fs::create_dir_all(&folder)?;
         let path = folder.join("Options.ini");
 
@@ -157,6 +159,32 @@ pub fn invert_texture_reduction(value: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_resolution_list_runs_narrowest_first_and_includes_ultrawides() {
+        let parsed: Vec<(u32, u32)> = RESOLUTIONS
+            .iter()
+            .map(|r| {
+                let (w, h) = r.split_once('×').unwrap_or_else(|| panic!("{r:?}"));
+                (w.parse().unwrap(), h.parse().unwrap())
+            })
+            .collect();
+
+        assert!(parsed.windows(2).all(|pair| pair[0] < pair[1]), "out of order or repeated");
+        for ultrawide in [(2560, 1080), (3440, 1440), (3840, 1600)] {
+            assert!(parsed.contains(&ultrawide), "{ultrawide:?} is missing");
+        }
+    }
+
+    #[test]
+    fn an_ultrawide_resolution_is_written_as_the_game_reads_it() {
+        let mut options = GameOptions { values: BTreeMap::new(), path: PathBuf::new() };
+
+        options.set_resolution("3440×1440");
+
+        assert_eq!(options.get("Resolution"), " 3440 1440");
+        assert_eq!(options.resolution(), "3440×1440");
+    }
 
     #[test]
     fn texture_reduction_round_trips() {

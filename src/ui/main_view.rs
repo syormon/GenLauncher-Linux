@@ -542,7 +542,7 @@ fn open_mod_folder(app: &mut GenLauncherApp, kind: ModificationType, name: &str)
 }
 
 fn open_user_folder(app: &mut GenLauncherApp, sub: &str) {
-    let folder = config::user_data_dir(app.session.game_mode, &app.store.data.proton).join(sub);
+    let folder = config::user_data_dir(app.session.game_mode).join(sub);
     if folder.is_dir() {
         util::open_external(&folder.to_string_lossy());
     } else {

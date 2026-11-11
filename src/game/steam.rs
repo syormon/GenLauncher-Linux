@@ -18,6 +18,14 @@ pub struct SteamGame {
     pub compat_data: PathBuf,
 }
 
+/// Whether the game in `game_dir` is Steam's edition: it ships Steam's API
+/// library next to its executables, which no other edition does. Where the
+/// folder is says nothing either way: a Steam copy can be moved out of its
+/// library, and anything can be put in one.
+pub fn is_steam_copy(game_dir: &Path) -> bool {
+    crate::util::fs::resolve_case_insensitive(game_dir, Path::new("steam_api.dll")).is_file()
+}
+
 impl SteamGame {
     /// The game in `game_dir`, if that is `<library>/steamapps/common/<installdir>`
     /// and the library has a manifest for it.
@@ -209,7 +217,7 @@ fn vdf_pair(line: &str) -> Option<(&str, &str)> {
 }
 
 /// The first value stored under `key`, at any depth.
-fn vdf_value(text: &str, key: &str) -> Option<String> {
+pub(crate) fn vdf_value(text: &str, key: &str) -> Option<String> {
     text.lines()
         .filter_map(vdf_pair)
         .find(|(k, _)| k.eq_ignore_ascii_case(key))
@@ -256,6 +264,20 @@ mod tests {
 
         assert_eq!(SteamGame::detect(&root), None);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_steam_copy_is_known_by_its_steam_api_dll() {
+        let dir = std::env::temp_dir().join(format!("gl-steam-api-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("generals.exe"), "").unwrap();
+        assert!(!is_steam_copy(&dir));
+
+        // Any casing, as a copy made on Windows may have it.
+        fs::write(dir.join("Steam_API.dll"), "").unwrap();
+        assert!(is_steam_copy(&dir));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

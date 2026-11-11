@@ -157,6 +157,9 @@ pub struct GenLauncherApp {
     pending_dialogs: Vec<Dialog>,
 
     pub busy: bool,
+    /// The size in pixels of the monitor the launcher is on, once the window
+    /// system has said. The recommended game resolution.
+    screen_size: Option<(u32, u32)>,
     /// The launch under way was asked for with "Launch vanilla": the game with
     /// nothing selected applied. Set when a game launch is requested and
     /// cleared when the game exits.
@@ -231,6 +234,7 @@ impl GenLauncherApp {
             dialog: None,
             pending_dialogs: Vec::new(),
             busy: false,
+            screen_size: None,
             vanilla_launch: false,
             add_progress: None,
             game_running: false,
@@ -492,14 +496,9 @@ impl GenLauncherApp {
                     .filter(|t| *t > 0)
                     .map(|t| (read as f32 / t as f32).clamp(0.0, 1.0))
                     .unwrap_or(0.0);
+                self.side.active = true;
                 self.side.fraction = fraction;
-                self.side.message = match total {
-                    Some(total) => i18n::trf(
-                        "DownloadInProgress",
-                        &[&(read / 1_048_576).to_string(), &(total / 1_048_576).to_string()],
-                    ),
-                    None => format!("{label}: {} MB", read / 1_048_576),
-                };
+                self.side.message = side_progress_text(&label, total, read);
             }
 
             Bg::SideDone { error } => {
@@ -509,6 +508,10 @@ impl GenLauncherApp {
                     Some(error) => format!("{}{error}", i18n::tr("Error")),
                     None => String::new(),
                 };
+                // A GE-Proton download changes what the options screen reports.
+                if let Some(options) = &mut self.options {
+                    options.refresh_proton_status();
+                }
             }
 
             Bg::GamePrepared { world_builder, ok } => {
@@ -795,9 +798,9 @@ impl GenLauncherApp {
     // -- options ----------------------------------------------------------
 
     pub fn apply_default_options(&mut self) {
-        match GameOptions::load(self.session.game_mode, &self.store.data.proton) {
+        match GameOptions::load(self.session.game_mode) {
             Ok(mut options) => {
-                if let Err(e) = options.apply_defaults(primary_screen_size()) {
+                if let Err(e) = options.apply_defaults(self.screen_size.unwrap_or(FALLBACK_SCREEN)) {
                     log::warn!("could not write Options.ini: {e:#}");
                 }
             }
@@ -1425,14 +1428,59 @@ enum LaunchStep {
     CheckIntegrity,
 }
 
-/// Best guess at the primary display size, for the recommended resolution.
-pub fn primary_screen_size() -> (u32, u32) {
-    (1920, 1080)
+/// The side progress bar's text: what is downloading and how far it is, or,
+/// for a step with no size such as unpacking, just what is happening.
+fn side_progress_text(label: &str, total: Option<u64>, read: u64) -> String {
+    let megabytes = |bytes: u64| (bytes / 1_048_576).to_string();
+    match total {
+        Some(total) => {
+            let amount = i18n::trf("DownloadInProgress", &[&megabytes(read), &megabytes(total)]);
+            if label.is_empty() { amount } else { format!("{label} · {amount}") }
+        }
+        None if read == 0 => label.to_owned(),
+        None => format!("{label}: {} MB", megabytes(read)),
+    }
+}
+
+/// The recommended resolution when the monitor's size is not known.
+const FALLBACK_SCREEN: (u32, u32) = (1920, 1080);
+
+impl GenLauncherApp {
+    /// Remember the size of the monitor the launcher is on, so "Set
+    /// recommended settings" picks its full resolution, ultrawide or not.
+    pub fn note_screen_size(&mut self, ctx: &egui::Context) {
+        let points = ctx.input(|i| i.viewport().monitor_size);
+        if let Some(pixels) = points.and_then(|p| screen_pixels(p, ctx.pixels_per_point())) {
+            if self.screen_size != Some(pixels) {
+                log::info!("monitor is {}×{}", pixels.0, pixels.1);
+                self.screen_size = Some(pixels);
+            }
+        }
+    }
+}
+
+/// A monitor's size in pixels, from its size in egui points. `None` for a
+/// size no monitor has, as some window systems report before they know.
+fn screen_pixels(points: egui::Vec2, pixels_per_point: f32) -> Option<(u32, u32)> {
+    let pixels = (points * pixels_per_point).round();
+    (pixels.x >= 1.0 && pixels.y >= 1.0).then_some((pixels.x as u32, pixels.y as u32))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{launch_set, reorder};
+    use super::{launch_set, reorder, screen_pixels};
+
+    #[test]
+    fn the_monitor_size_is_measured_in_pixels() {
+        // An ultrawide at 100%, and at 125% where egui counts fewer points.
+        assert_eq!(screen_pixels(egui::vec2(3440.0, 1440.0), 1.0), Some((3440, 1440)));
+        assert_eq!(screen_pixels(egui::vec2(2752.0, 1152.0), 1.25), Some((3440, 1440)));
+        // Rounding, not truncating, a size that does not divide evenly.
+        assert_eq!(screen_pixels(egui::vec2(2293.333, 960.0), 1.5), Some((3440, 1440)));
+        // Nothing known yet.
+        assert_eq!(screen_pixels(egui::Vec2::ZERO, 1.0), None);
+    }
+
     use crate::config::Game;
     use crate::model::{ModVersion, ModificationType, ReposVersion};
     use crate::state::Store;

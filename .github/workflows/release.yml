@@ -120,11 +120,15 @@ jobs:
       - name: Test
         run: cargo test --target ${{ matrix.target }}
 
-      # A whole launch through a stand-in Proton. It claims the process-wide
-      # game folder, so it is `#[ignore]`d in the main run and runs alone here.
+      # Whole launches through a stand-in Proton: a Steam install, and a copy
+      # outside Steam on the launcher's own GE-Proton. Each claims the
+      # process-wide game folder, so they are `#[ignore]`d in the main run and
+      # run one at a time here, by exact name.
       - name: Proton launch end-to-end
         if: runner.os == 'Linux'
-        run: cargo test --target ${{ matrix.target }} proton_launch_end_to_end -- --ignored
+        run: |
+          cargo test --target ${{ matrix.target }} game::launcher::tests::proton_launch_end_to_end -- --ignored --exact
+          cargo test --target ${{ matrix.target }} game::launcher::tests::managed_proton_launch_end_to_end -- --ignored --exact
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}

@@ -223,11 +223,12 @@ impl SingleInstance {
 struct Launcher {
     app: GenLauncherApp,
     startup_done: bool,
+    frames: ui::frame_limiter::FrameLimiter,
 }
 
 impl Launcher {
     fn new(cc: &eframe::CreationContext<'_>, game: Game) -> Self {
-        Self { app: GenLauncherApp::new(cc, game), startup_done: false }
+        Self { app: GenLauncherApp::new(cc, game), startup_done: false, frames: Default::default() }
     }
 }
 
@@ -253,10 +254,14 @@ impl eframe::App for Launcher {
     /// message that says the game has exited and the window should come back.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.app.pump_messages(ctx);
+        self.app.note_screen_size(ctx);
         self.handle_closing(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Only drawn frames are held back; `logic` still runs unthrottled.
+        self.frames.wait();
+
         match &self.app.phase {
             Phase::Initializing { status } => {
                 let status = status.clone();

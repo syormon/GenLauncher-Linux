@@ -8,7 +8,7 @@ use crate::config::{self, Game};
 use crate::game::options::{self, GameOptions, RESOLUTIONS, TOGGLE_KEYS};
 use crate::game::{gentool, proton};
 use crate::i18n;
-use crate::model::ProtonSettings;
+use crate::model::{ProtonRunner, ProtonSettings};
 use crate::util;
 
 pub struct OptionsState {
@@ -26,6 +26,8 @@ pub struct OptionsState {
     proton: ProtonSettings,
     /// What a launch would run with, or why it cannot.
     proton_status: Result<String, String>,
+    /// Which edition the game is, which decides what runs it by default.
+    installation: proton::Installation,
 }
 
 impl OptionsState {
@@ -43,6 +45,7 @@ impl OptionsState {
             force_english: english_marker().is_file(),
             proton_status: proton_status(&proton),
             proton,
+            installation: if cfg!(windows) { proton::Installation::Other } else { proton::installation() },
         };
         state.load_game_options(app.session.game_mode);
         state
@@ -50,7 +53,7 @@ impl OptionsState {
 
     /// Read `Options.ini`, which under Proton lives in the prefix's Documents.
     fn load_game_options(&mut self, game: Game) {
-        let (options, load_error) = match GameOptions::load(game, &self.proton) {
+        let (options, load_error) = match GameOptions::load(game) {
             Ok(o) => (Some(o), None),
             Err(e) => (None, Some(format!("{e:#}"))),
         };
@@ -65,10 +68,13 @@ impl OptionsState {
         self.load_error = load_error;
     }
 
-    /// A different Proton may mean a different prefix, and `Options.ini`.
-    fn proton_changed(&mut self, game: Game) {
+    fn proton_changed(&mut self) {
         self.proton_status = proton_status(&self.proton);
-        self.load_game_options(game);
+    }
+
+    /// Say again what a launch would use: a download may have changed it.
+    pub fn refresh_proton_status(&mut self) {
+        self.proton_changed();
     }
 }
 
@@ -270,29 +276,71 @@ fn launcher_settings(app: &mut GenLauncherApp, state: &mut OptionsState, ui: &mu
     });
 }
 
-/// The game is a Windows program; off Windows it runs through Steam's Proton.
-fn proton_settings(app: &GenLauncherApp, state: &mut OptionsState, ui: &mut egui::Ui) {
+/// The game is a Windows program; off Windows it runs through Proton.
+fn proton_settings(app: &mut GenLauncherApp, state: &mut OptionsState, ui: &mut egui::Ui) {
     let palette = app.palette;
     crate::ui::theme::heading(ui, &palette, "Proton");
     let mut changed = false;
 
-    ui.label(RichText::new(i18n::tr("ProtonBuild")).size(13.0));
-    ui.horizontal(|ui| {
-        let width = ui.available_width() - 80.0;
-        changed |= ui
-            .add(
-                egui::TextEdit::singleline(&mut state.proton.proton)
-                    .hint_text(i18n::tr("ProtonBuildHint"))
-                    .desired_width(width),
-            )
-            .lost_focus();
-        if ui.button(i18n::tr("Browse")).clicked() {
-            if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                state.proton.proton = path.display().to_string();
-                changed = true;
-            }
+    // An older config's folder meant "use this one".
+    if state.proton.runner == ProtonRunner::Auto && !state.proton.proton.trim().is_empty() {
+        state.proton.runner = ProtonRunner::Custom;
+    }
+
+    // Which edition the game is decides what runs it by default.
+    let is_steam_install = state.installation.is_steam();
+    let found = match &state.installation {
+        proton::Installation::Steam(steam) => i18n::trf("ProtonSteamInstall", &[&steam.app_id]),
+        proton::Installation::SteamElsewhere => i18n::tr("ProtonSteamElsewhere"),
+        proton::Installation::Other => i18n::tr("ProtonNotSteamInstall"),
+    };
+    ui.label(RichText::new(found).size(13.0));
+
+    let mut custom = state.proton.runner == ProtonRunner::Custom;
+    // A Steam install leaves Proton to Steam unless asked otherwise.
+    if is_steam_install && !custom {
+        let mut managed = state.proton.runner == ProtonRunner::Managed;
+        if ui.checkbox(&mut managed, i18n::tr("ProtonUseManaged")).changed() {
+            state.proton.runner = if managed { ProtonRunner::Managed } else { ProtonRunner::Auto };
+            changed = true;
         }
-    });
+    }
+    if ui.checkbox(&mut custom, i18n::tr("ProtonUseCustom")).changed() {
+        state.proton.runner = if custom { ProtonRunner::Custom } else { ProtonRunner::Auto };
+        changed = true;
+    }
+
+    if state.proton.runner == ProtonRunner::Custom {
+        ui.horizontal(|ui| {
+            let width = ui.available_width() - 80.0;
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut state.proton.proton)
+                        .hint_text(i18n::tr("ProtonBuildHint"))
+                        .desired_width(width),
+                )
+                .lost_focus();
+            if ui.button(i18n::tr("Browse")).clicked() {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    state.proton.proton = path.display().to_string();
+                    changed = true;
+                }
+            }
+        });
+    } else if !state.proton.proton.is_empty() {
+        // Only a custom folder is kept: anything else would read as one.
+        state.proton.proton.clear();
+    }
+
+    // The launcher's own GE-Proton, when it is what runs the game.
+    let uses_managed = match state.proton.runner {
+        ProtonRunner::Managed => true,
+        ProtonRunner::Auto => !is_steam_install,
+        ProtonRunner::Custom => false,
+    };
+    if uses_managed {
+        managed_proton_row(app, ui);
+    }
 
     ui.label(RichText::new(i18n::tr("ProtonEnv")).size(13.0));
     changed |= ui
@@ -306,7 +354,7 @@ fn proton_settings(app: &GenLauncherApp, state: &mut OptionsState, ui: &mut egui
     changed |= ui.checkbox(&mut state.proton.virtual_desktop, i18n::tr("ProtonVirtualDesktop")).changed();
 
     if changed {
-        state.proton_changed(app.session.game_mode);
+        state.proton_changed();
     }
 
     match &state.proton_status {
@@ -321,6 +369,28 @@ fn proton_settings(app: &GenLauncherApp, state: &mut OptionsState, ui: &mut egui
             state.proton_status = Err(format!("{e:#}"));
         }
     }
+}
+
+/// The launcher's GE-Proton: which version is on disk, and a button to fetch
+/// the latest.
+fn managed_proton_row(app: &mut GenLauncherApp, ui: &mut egui::Ui) {
+    let palette = app.palette;
+    ui.horizontal(|ui| {
+        let installed = proton::managed_version();
+        let text = match &installed {
+            Some(version) => i18n::trf("ProtonManagedInstalled", &[version]),
+            None => i18n::tr("ProtonManagedMissing"),
+        };
+        ui.label(RichText::new(text).size(12.0).color(palette.inactive_border));
+        // Not while a game runs on it, or another download is under way.
+        let idle = !app.busy && !app.launch_in_progress() && app.side.message.is_empty();
+        let label = if installed.is_some() { "ProtonManagedUpdate" } else { "ProtonManagedDownload" };
+        if ui.add_enabled(idle, egui::Button::new(i18n::tr(label))).clicked() {
+            app.side.active = true;
+            app.side.message = i18n::tr("Preparing");
+            crate::tasks::spawn_proton_update(app.tx.clone());
+        }
+    });
 }
 
 fn game_settings(app: &mut GenLauncherApp, state: &mut OptionsState, ui: &mut egui::Ui) {

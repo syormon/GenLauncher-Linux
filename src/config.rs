@@ -111,13 +111,13 @@ pub fn mod_image_path(name: &str, version: &str) -> PathBuf {
 /// Directory holding the user's Options.ini, Replays and Maps for `game`.
 ///
 /// Under Proton the game writes into the prefix's Documents folder
-/// (`…/compatdata/<appid>/pfx/drive_c/users/steamuser/Documents`), not the
-/// Linux user's own `~/Documents`.
-pub fn user_data_dir(game: Game, proton: &crate::model::ProtonSettings) -> PathBuf {
+/// (`…/compatdata/<appid>/pfx/drive_c/users/steamuser/Documents` for a Steam
+/// install), not the Linux user's own `~/Documents`.
+pub fn user_data_dir(game: Game) -> PathBuf {
     let prefix_docs = if cfg!(windows) {
         None
     } else {
-        crate::game::proton::prefix(proton).map(|prefix| crate::game::proton::game_documents_dir(&prefix))
+        Some(crate::game::proton::game_documents_dir(&crate::game::proton::prefix()))
     };
 
     let docs = prefix_docs

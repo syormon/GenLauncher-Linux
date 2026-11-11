@@ -597,11 +597,21 @@ fn run_launch(request: LaunchRequest, tx: Sender<Bg>) {
         proton,
     } = request;
 
-    // A prefix Proton has not created yet has no `Options.ini`, and the
-    // game crashes on start without one; this writes the stock file.
-    // Only with a prefix to put it in: otherwise it would land in ~/Documents.
-    if cfg!(not(windows)) && game::proton::prefix(&proton).is_some() {
-        if let Err(e) = game::options::GameOptions::load(session.game_mode, &proton) {
+    if cfg!(not(windows)) {
+        // Before anything is linked into the game folder, so a failure here
+        // leaves nothing to undo. The first launch downloads GE-Proton.
+        if let Err(e) = prepare_proton(&proton, &tx) {
+            let _ = tx.send(Bg::GameFinished {
+                world_builder,
+                played_long_enough: false,
+                error: Some(format!("{e:#}")),
+            });
+            return;
+        }
+
+        // A prefix Proton has not created yet has no `Options.ini`, and the
+        // game crashes on start without one; this writes the stock file.
+        if let Err(e) = game::options::GameOptions::load(session.game_mode) {
             log::warn!("could not prepare Options.ini: {e:#}");
         }
     }
@@ -743,6 +753,34 @@ fn update_vulkan_layer(connected: bool, vulkan: Option<&VulkanData>, tx: &Sender
 
     let error = result.err().map(|e| format!("{e:#}"));
     let _ = tx.send(Bg::SideDone { error });
+}
+
+/// Download whatever the chosen Proton still needs, showing it on the side
+/// progress bar.
+fn prepare_proton(proton: &crate::model::ProtonSettings, tx: &Sender<Bg>) -> anyhow::Result<()> {
+    let progress_tx = tx.clone();
+    let result = game::proton::ensure_ready(proton, &|label, total, read| {
+        let _ = progress_tx.send(Bg::SideProgress { label: label.to_owned(), total, read });
+    });
+    if !matches!(result, Ok(false)) {
+        let error = result.as_ref().err().map(|e| format!("Proton: {e:#}"));
+        let _ = tx.send(Bg::SideDone { error });
+    }
+    result.map(|_| ())
+}
+
+/// Bring the managed GE-Proton up to date, on the side progress bar.
+pub fn spawn_proton_update(tx: Sender<Bg>) {
+    std::thread::spawn(move || {
+        let progress_tx = tx.clone();
+        let result = game::proton::update_managed(&|label, total, read| {
+            let _ = progress_tx.send(Bg::SideProgress { label: label.to_owned(), total, read });
+        });
+        if let Err(e) = &result {
+            log::warn!("could not update GE-Proton: {e:#}");
+        }
+        let _ = tx.send(Bg::SideDone { error: result.err().map(|e| format!("GE-Proton: {e:#}")) });
+    });
 }
 
 /// Download an executable from the repository unless it is already on disk.

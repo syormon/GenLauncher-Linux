@@ -374,7 +374,7 @@ fn virtual_desktop(settings: &ProtonSettings) -> Option<(u32, u32)> {
         return None;
     }
     let game = crate::tasks::detect_game().unwrap_or(Game::ZeroHour);
-    let resolution = crate::game::options::GameOptions::load(game, settings)
+    let resolution = crate::game::options::GameOptions::load(game)
         .map(|o| o.resolution())
         .unwrap_or_default();
     Some(parse_resolution(&resolution).unwrap_or((1024, 768)))
@@ -419,7 +419,7 @@ mod tests {
     /// restore the folder.
     ///
     /// It claims the process-wide game folder, so it must run on its own:
-    /// `cargo test proton_launch_end_to_end -- --ignored`.
+    /// `cargo test game::launcher::tests::proton_launch_end_to_end -- --ignored --exact`.
     #[cfg(unix)]
     #[test]
     #[ignore = "claims the process-wide game folder; run on its own with --ignored"]
@@ -442,8 +442,9 @@ mod tests {
         config::set_game_dir(game.clone());
         assert_eq!(config::game_dir(), game, "another test claimed the game folder first");
 
-        // Mixed-case names, as a copy from a Windows install may have.
-        for name in ["Generals.exe", "BINKW32.DLL", "d3d8.dll"] {
+        // Mixed-case names, as a copy from a Windows install may have. Steam's
+        // edition is known by its steam_api.dll.
+        for name in ["Generals.exe", "BINKW32.DLL", "d3d8.dll", "Steam_api.dll"] {
             fs::write(game.join(name), "").unwrap();
         }
         fs::write(game.join("WindowZH.big"), "BIGF").unwrap();
@@ -496,6 +497,7 @@ mod tests {
             proton: fake_proton.display().to_string(),
             env: "FOO=bar WINEDLLOVERRIDES=dxgi=b".into(),
             virtual_desktop: false,
+            ..Default::default()
         };
         let started = Instant::now();
         run_game(std::slice::from_ref(&version), true, true, "-extra", None, &settings).unwrap();
@@ -516,7 +518,7 @@ mod tests {
         expect(&format!("cwd: {}", game.display()));
         expect(&format!("STEAM_COMPAT_DATA_PATH={}", compat.display()));
         expect("SteamAppId=2732960");
-        expect("WINEDLLOVERRIDES=binkw32,d3d8=n,b;dxgi=b");
+        expect("WINEDLLOVERRIDES=binkw32,d3d8,steam_api=n,b;dxgi=b");
         expect("WINEDEBUG=-all");
         expect("FOO=bar");
         // The mod was still linked in while the game ran.
@@ -528,10 +530,97 @@ mod tests {
         assert!(!game.join("!TestMod.big").exists());
 
         assert_eq!(
-            config::user_data_dir(Game::ZeroHour, &settings),
+            config::user_data_dir(Game::ZeroHour),
             docs.join("Command and Conquer Generals Zero Hour Data")
         );
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A launch of a copy of the game outside Steam, on the launcher's own
+    /// GE-Proton and runtime (stand-ins, already "downloaded" into a scratch
+    /// data folder): run inside the runtime, in the launcher's prefix, with no
+    /// Steam app id, and with the game's drive visible to the container.
+    ///
+    /// It claims the process-wide game folder and sets `XDG_DATA_HOME`, so it
+    /// must run on its own:
+    /// `cargo test game::launcher::tests::managed_proton_launch_end_to_end -- --ignored --exact`.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "claims the process-wide game folder; run on its own with --ignored"]
+    fn managed_proton_launch_end_to_end() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("gl-e2e-managed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let game = root.join("games/Zero Hour");
+        let data = root.join("data");
+        std::env::set_var("XDG_DATA_HOME", &data);
+        let launcher_data = data.join("genlauncher");
+
+        fs::create_dir_all(&game).unwrap();
+        config::set_game_dir(game.clone());
+        assert_eq!(config::game_dir(), game, "another test claimed the game folder first");
+        for name in ["generals.exe", "binkw32.dll"] {
+            fs::write(game.join(name), "").unwrap();
+        }
+        fs::write(game.join("WindowZH.big"), "BIGF").unwrap();
+
+        // What a download leaves: GE-Proton asking for the sniper runtime,
+        // the runtime, and the record of both.
+        let log = root.join("run.log");
+        let proton_dir = launcher_data.join("runtime/proton/GE-Proton-Test");
+        let entry = launcher_data.join("runtime/steamrt-1628350/_v2-entry-point");
+        fs::create_dir_all(&proton_dir).unwrap();
+        fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        fs::write(proton_dir.join("toolmanifest.vdf"), "\"manifest\"\n{\n \"require_tool_appid\" \"1628350\"\n}\n")
+            .unwrap();
+        fs::write(launcher_data.join("runtime/state.json"), r#"{"proton":"GE-Proton-Test","runtimes":{"1628350":"1"}}"#)
+            .unwrap();
+        // The runtime notes what it was asked, then runs what follows `--`.
+        fs::write(
+            &entry,
+            format!("#!/bin/bash\necho \"runtime: $*\" > '{}'\nwhile [ \"$1\" != -- ]; do shift; done; shift\nexec \"$@\"\n", log.display()),
+        )
+        .unwrap();
+        fs::write(
+            proton_dir.join("proton"),
+            format!(
+                "#!/bin/bash\n\
+                 {{ echo \"proton: $*\"; echo \"STEAM_COMPAT_DATA_PATH=$STEAM_COMPAT_DATA_PATH\";\n\
+                    echo \"STEAM_COMPAT_CLIENT_INSTALL_PATH=$STEAM_COMPAT_CLIENT_INSTALL_PATH\";\n\
+                    echo \"STEAM_COMPAT_MOUNTS=$STEAM_COMPAT_MOUNTS\"; echo \"SteamAppId=$SteamAppId\"; }} >> '{}'\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        for script in [&entry, &proton_dir.join("proton")] {
+            fs::set_permissions(script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let settings = ProtonSettings { virtual_desktop: false, ..Default::default() };
+        // Automatic picks the launcher's own for a game outside Steam, and
+        // there is nothing left to download.
+        let ready = proton::ensure_ready(&settings, &|label, _, _| panic!("tried to download: {label}"));
+        assert!(!ready.unwrap(), "something was downloaded");
+
+        run_game(&[], true, false, "", None, &settings).unwrap();
+
+        let logged = fs::read_to_string(&log).unwrap();
+        let expect = |needle: &str| assert!(logged.contains(needle), "the log lacks {needle:?}:\n{logged}");
+        expect(&format!("runtime: --verb=waitforexitandrun -- {}", proton_dir.join("proton").display()));
+        expect(&format!("proton: waitforexitandrun {} -win", game.join("generals.exe").display()));
+        expect(&format!("STEAM_COMPAT_DATA_PATH={}", launcher_data.join("prefix").display()));
+        expect(&format!("STEAM_COMPAT_CLIENT_INSTALL_PATH={}", launcher_data.join("steam").display()));
+        expect(&format!("STEAM_COMPAT_MOUNTS={}:", game.display()));
+        expect("SteamAppId=0");
+
+        // Options.ini goes into the launcher's prefix, as steamuser's.
+        assert_eq!(
+            config::user_data_dir(Game::ZeroHour),
+            launcher_data.join("prefix/pfx/drive_c/users/steamuser/Documents/Command and Conquer Generals Zero Hour Data")
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

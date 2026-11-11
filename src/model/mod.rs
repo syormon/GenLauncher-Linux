@@ -392,13 +392,28 @@ impl GameModification {
     }
 }
 
-/// How the game runs through Proton on Linux (see `game::proton`). Empty
-/// fields mean "do what Steam does".
+/// Which Proton runs the game on Linux.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProtonRunner {
+    /// Decided by where the game is: a Steam install runs on the Proton Steam
+    /// runs it with, anything else on the managed GE-Proton. A `Proton`
+    /// folder set in an older config still counts, as `Custom`.
+    #[default]
+    #[serde(alias = "Steam")]
+    Auto,
+    /// GE-Proton, downloaded and kept by the launcher, even for a Steam
+    /// install.
+    Managed,
+    /// The folder in `ProtonSettings::proton`.
+    Custom,
+}
+
+/// How the game runs through Proton on Linux (see `game::proton`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ProtonSettings {
-    /// A Proton folder, or its `proton` script, to use instead of the one
-    /// Steam runs the game with.
+    pub runner: ProtonRunner,
+    /// A Proton folder, or its `proton` script, for `ProtonRunner::Custom`.
     #[serde(deserialize_with = "null_to_empty")]
     pub proton: String,
     /// Extra environment, as whitespace-separated `KEY=VALUE` pairs.
@@ -412,7 +427,7 @@ pub struct ProtonSettings {
 
 impl Default for ProtonSettings {
     fn default() -> Self {
-        Self { proton: String::new(), env: String::new(), virtual_desktop: true }
+        Self { runner: ProtonRunner::Auto, proton: String::new(), env: String::new(), virtual_desktop: true }
     }
 }
 

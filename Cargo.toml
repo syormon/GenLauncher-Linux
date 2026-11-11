@@ -1,6 +1,6 @@
 [package]
 name = "genlauncher"
-version = "1.0.7"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.95"
 description = "Mod manager for Command & Conquer: Generals and Zero Hour"
@@ -31,6 +31,11 @@ quick-xml = "0.37"
 
 zip = { version = "2", default-features = false, features = ["deflate", "bzip2", "zstd", "time"] }
 sevenz-rust2 = "0.13"
+# The managed GE-Proton (.tar.gz) and Steam Linux Runtime (.tar.xz) on Linux.
+tar = "0.4"
+flate2 = "1"
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "xz", "optimization"] }
+sha2 = "0.10"
 
 rfd = "0.15"
 open = "5"
@@ -46,6 +51,10 @@ chrono = "0.4"
 rand = "0.8"
 sys-locale = "0.3"
 dirs = "5"
+
+[dev-dependencies]
+# Tests build .tar.xz archives to unpack.
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "xz", "encoder"] }
 
 [build-dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "ico"] }

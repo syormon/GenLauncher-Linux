@@ -2,6 +2,7 @@ pub mod big;
 pub mod custom_engine;
 pub mod gentool;
 pub mod launcher;
+pub mod managed_proton;
 pub mod mod_archive;
 pub mod options;
 pub mod proton;

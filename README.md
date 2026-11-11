@@ -20,6 +20,16 @@ This is a based off of [GenLauncher](https://github.com/p0ls3r/GenLauncher). Tes
 
 > If you're having issues running the game, check [protondb](https://www.protondb.com/app/2732960) and configure the compatability mode of the game to use the newest version of proton. I used `experimental` on ubuntu26.
 
+## Linux
+
+The launcher is a native Linux program; it can force the game to run through Proton, and Steam is not required. Which Proton depends on whether the game is a Steam installation (has `steam_api.dll` in the game folder).
+
+- **A Steam installation** Uses Steam's Proton settings to run. Start the game once from Steam first, so Steam has set it up.
+- **Anything else** runs on the launcher's own GE-Proton. The first launch downloads the latest [GE-Proton](https://github.com/GloriousEggroll/proton-ge-custom) and the Steam Linux Runtime it was built for (~750 MB, checksums verified), and the game runs inside that runtime, as Steam would run it. **Update** in the options fetches newer releases.
+- **Use a Proton folder of my own** overrides both: any Proton, e.g. one installed by Steam or ProtonUp-Qt.
+
+A Steam installation in its Steam library keeps Steam's own prefix, so saves and `Options.ini` are shared with Steam's launch, whichever Proton runs it. Anything else gets the launcher's own prefix. GE-Proton, the runtime and that prefix live in `~/.local/share/genlauncher/` (`runtime/`, `prefix/`), shared by every game folder.
+
 ## Differences from the original
 
 * lock file rather than a mutex, so it works the same on Windows/Linux.
@@ -32,7 +42,9 @@ This is a based off of [GenLauncher](https://github.com/p0ls3r/GenLauncher). Tes
 * **Modded executable.** `Use modded exe files` [default] now downloads the repository's `ModdedExe` and runs it.
 * With `Install and autoupdate Gentool` on [default], each game launch checks
 gentool.net and installs or updates GenTool's `d3d8.dll` in the game folder.
-With it off, `d3d8.dll` is moved aside for the run. 
+With it off, `d3d8.dll` is moved aside for the run.
+* ultra-wide resolution support.
+* linux binary includes baked in proton support (similar to umu-launcher) for ease of use with non-steam versions of the game
 
 ### Known issues and their workarounds
 
@@ -66,7 +78,14 @@ for `game.dat`, and restoring the folder. It claims the process-wide game
 folder, so run it on its own (CI does):
 
 ```bash
-cargo test proton_launch_end_to_end -- --ignored
+cargo test game::launcher::tests::proton_launch_end_to_end -- --ignored --exact
+```
+
+A second does the same for a copy of the game outside Steam, on the launcher's own GE-Proton and runtime (stand-ins), and `live_listings_parse` checks that GE-Proton's and Valve's real release listings still parse, without downloading the archives:
+
+```bash
+cargo test game::launcher::tests::managed_proton_launch_end_to_end -- --ignored --exact
+cargo test live_listings_parse -- --ignored
 ```
 
 ## General Network usage:
@@ -80,3 +99,4 @@ cargo test proton_launch_end_to_end -- --ignored
 | Launching with GenTool on | the gentool.net front page, and GenTool itself when it is missing or outdated |
 | Launching Zero Hour with "Use modded exe files" on | the repository's modded executable, once |
 | Launching with Vulkan on | the Vulkan layer, if the repository has a newer one |
+| Launching on Linux with the launcher's GE-Proton | GitHub's GE-Proton release listing and GE-Proton itself, and repo.steampowered.com's Steam Linux Runtime, the first time only; Options > Proton > Update checks for newer ones |
