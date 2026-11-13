@@ -3,12 +3,14 @@
 //! Mods get the tall layout with 500x100 artwork; everything else uses the
 //! compact one, matching `ModificationTemplate` and `AddonsTemplate`.
 
-use egui::{Align, Layout, RichText, Sense, Ui, Vec2};
+use egui::text::{LayoutJob, TextFormat};
+use egui::{Align, Color32, FontId, Layout, RichText, Sense, Ui, Vec2};
 
 use crate::app::DownloadState;
 use crate::config;
 use crate::i18n;
 use crate::model::colors::Palette;
+use crate::game::engine_package::EnginePackage;
 use crate::model::{EngineChoice, GameModification, ModificationType};
 use crate::ui::theme;
 
@@ -28,6 +30,8 @@ pub enum RowAction {
     OpenUrl(String),
     /// Which game engine to start this mod with, when it ships its own.
     SetEngine(EngineChoice),
+    /// Which launch profile to start a game engine package with.
+    SetEngineProfile(usize),
     OpenModFolder,
     SetImage,
     OpenGameFolder,
@@ -54,6 +58,8 @@ pub struct RowContext<'a> {
     pub thank_you: bool,
     /// Set for a mod known to ship its own game engine: the current choice.
     pub engine: Option<EngineChoice>,
+    /// Set when the card's version is a game engine package rather than a mod.
+    pub engine_package: Option<EnginePackage>,
 }
 
 /// Draw a full mod row.
@@ -192,7 +198,7 @@ pub fn mod_row(
         action = RowAction::Deselect;
     }
 
-    if let Some(menu_action) = context_menu(&response, modification, ctx.engine) {
+    if let Some(menu_action) = context_menu(&response, modification, ctx.engine, ctx.engine_package.as_ref()) {
         action = menu_action;
     }
 
@@ -279,7 +285,7 @@ pub fn addon_row(
         action = RowAction::Deselect;
     }
 
-    if let Some(menu_action) = context_menu(&response, modification, ctx.engine) {
+    if let Some(menu_action) = context_menu(&response, modification, ctx.engine, ctx.engine_package.as_ref()) {
         action = menu_action;
     }
 
@@ -298,9 +304,13 @@ fn header(
     let palette = ctx.palette;
     let mut action = None;
 
-    let detail = RichText::new(latest_version_label(modification))
-        .size(detail_size)
-        .color(if ctx.selected { palette.default_text } else { palette.inactive_border });
+    let detail = detail_text(
+        &latest_version_label(modification, ctx.engine_package.is_some()),
+        ctx.engine_package.is_some(),
+        detail_size,
+        if ctx.selected { palette.default_text } else { palette.inactive_border },
+        palette,
+    );
 
     ui.horizontal(|ui| {
         // Laid out from the right, so the picker claims its width first and
@@ -330,7 +340,7 @@ fn name_text(modification: &GameModification, selected: bool, palette: &Palette)
     }
 }
 
-fn latest_version_label(modification: &GameModification) -> String {
+fn latest_version_label(modification: &GameModification, engine_package: bool) -> String {
     let version = modification
         .latest_version()
         .map(|v| v.version().to_owned())
@@ -338,9 +348,32 @@ fn latest_version_label(modification: &GameModification) -> String {
     let mut label = format!("{}{version}", i18n::tr("LatestVersion"));
     if modification.kind() == ModificationType::Mod && modification.is_user_added() {
         label.push(' ');
-        label.push_str(&i18n::tr("UserAddedMod"));
+        // The tag beside it already says what it is.
+        label.push_str(&i18n::tr(if engine_package { "UserAdded" } else { "UserAddedMod" }));
     }
     label
+}
+
+/// The card's version line. A game engine package gets a tag after it, so it
+/// stands apart from the mods around it.
+fn detail_text(label: &str, engine_package: bool, size: f32, color: Color32, palette: &Palette) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    job.append(label, 0.0, TextFormat { font_id: FontId::proportional(size), color, ..Default::default() });
+    if engine_package {
+        // No-break spaces pad the tag inside its background.
+        job.append(
+            &format!("\u{a0}{}\u{a0}", i18n::tr("GameEngineTag")),
+            size * 0.6,
+            TextFormat {
+                font_id: FontId::proportional(size * 0.85),
+                color: palette.dark_background,
+                background: palette.active,
+                valign: Align::Center,
+                ..Default::default()
+            },
+        );
+    }
+    job
 }
 
 const VERSION_PICKER_WIDTH: f32 = 190.0;
@@ -439,6 +472,7 @@ fn context_menu(
     response: &egui::Response,
     modification: &GameModification,
     engine: Option<EngineChoice>,
+    package: Option<&EnginePackage>,
 ) -> Option<RowAction> {
     let mut action = None;
 
@@ -460,6 +494,19 @@ fn context_menu(
         if !info.discord_link.is_empty() && ui.button(i18n::tr("Discord")).clicked() {
             action = Some(RowAction::OpenUrl(info.discord_link.clone()));
             ui.close();
+        }
+
+        // A game engine package: the ways its own scripts started it.
+        if let Some(package) = package.filter(|p| p.profiles.len() > 1) {
+            ui.separator();
+            ui.menu_button(i18n::tr("EngineProfileMenu"), |ui| {
+                for (index, profile) in package.profiles.iter().enumerate() {
+                    if ui.radio(package.selected == index, &profile.name).clicked() {
+                        action = Some(RowAction::SetEngineProfile(index));
+                        ui.close();
+                    }
+                }
+            });
         }
 
         // Only for a mod that ships its own game engine.
@@ -586,6 +633,7 @@ mod tests {
             enabled: true,
             thank_you: false,
             engine: None,
+            engine_package: None,
         };
 
         let ctx = egui::Context::default();
@@ -671,7 +719,7 @@ mod tests {
             installed: true,
             ..Default::default()
         };
-        let label = |v: &ModVersion| latest_version_label(&GameModification::new(v));
+        let label = |v: &ModVersion| latest_version_label(&GameModification::new(v), false);
         let marker = i18n::tr("UserAddedMod");
 
         let added = label(&version(ModificationType::Mod, ""));

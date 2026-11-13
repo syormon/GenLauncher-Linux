@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use crate::config::{self, Game, SessionInfo};
-use crate::game::{big, proton, symlinks};
+use crate::game::{big, engine_package, proton, symlinks};
 use crate::model::{ModVersion, ModificationType, ProtonSettings};
 use crate::util::fs as gfs;
 
@@ -85,12 +85,12 @@ pub fn prepare_game_files(
     }
 
     for version in versions {
-        symlinks::create_mirrors_from_folder(
-            &version.folder_path(),
-            "",
-            create_links_on_empty_bigs,
-            version.kind() != ModificationType::Executable,
-        );
+        let folder = version.folder_path();
+        // A game engine package is its executables and libraries, so they
+        // are linked in as well; a mod's never are.
+        let links_for_mod =
+            version.kind() != ModificationType::Executable && !engine_package::is_package(&folder);
+        symlinks::create_mirrors_from_folder(&folder, "", create_links_on_empty_bigs, links_for_mod);
     }
 
     for exe in versions.iter().filter(|v| v.kind() == ModificationType::Executable) {
@@ -254,13 +254,24 @@ pub struct RunOutcome {
     pub played_long_enough: bool,
 }
 
+/// An engine to start in place of the game's own: a mod's, or an engine
+/// package's, already linked into the game folder.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineStart {
+    /// Relative to the game folder.
+    pub exe: String,
+    /// Its own arguments, before the launcher's.
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
 /// Start the game executable and block until it exits.
 pub fn run_game(
     versions: &[ModVersion],
     windowed: bool,
     quick_start: bool,
     extra_params: &str,
-    engine: Option<&str>,
+    engine: Option<&EngineStart>,
     proton: &ProtonSettings,
 ) -> Result<RunOutcome> {
     let executables: Vec<&ModVersion> = versions
@@ -269,7 +280,7 @@ pub fn run_game(
         .collect();
 
     // A mod's own engine, when the user chose it, comes before everything else.
-    let main_exe = engine.map(str::to_owned).unwrap_or_else(|| {
+    let main_exe = engine.map(|e| e.exe.clone()).unwrap_or_else(|| {
         executables
             .iter()
             .find(|v| v.info.replaces_original_game_file)
@@ -277,7 +288,7 @@ pub fn run_game(
             .unwrap_or_else(|| "generals.exe".to_owned())
     });
 
-    let mut args = Vec::new();
+    let mut args = engine.map(|e| e.args.clone()).unwrap_or_default();
     if windowed {
         args.push("-win".to_owned());
     }
@@ -290,15 +301,16 @@ pub fn run_game(
     );
 
     let started = Instant::now();
+    let env = engine.map(|e| e.env.as_slice()).unwrap_or_default();
     let mut child =
-        spawn_exe(&main_exe, &args, proton).with_context(|| format!("cannot start {main_exe}"))?;
+        spawn_exe(&main_exe, &args, env, proton).with_context(|| format!("cannot start {main_exe}"))?;
 
     // Companion executables (overlays, online clients) run alongside the game.
     for exe in executables
         .iter()
         .filter(|v| !v.info.replaces_original_game_file && !v.info.executable_file_name.is_empty())
     {
-        if let Err(e) = spawn_exe(&exe.info.executable_file_name, &[], proton) {
+        if let Err(e) = spawn_exe(&exe.info.executable_file_name, &[], &[], proton) {
             log::warn!("could not start {}: {e}", exe.info.executable_file_name);
         }
     }
@@ -338,7 +350,7 @@ pub fn run_world_builder(versions: &[ModVersion], proton: &ProtonSettings) -> Re
         .map(|v| v.info.executable_file_name.clone())
         .unwrap_or_else(|| "WorldBuilder.exe".to_owned());
 
-    let mut child = spawn_exe(&exe, &[], proton).with_context(|| format!("cannot start {exe}"))?;
+    let mut child = spawn_exe(&exe, &[], &[], proton).with_context(|| format!("cannot start {exe}"))?;
     let _ = child.wait();
     wait_for_game_processes(&exe);
     Ok(())
@@ -348,12 +360,18 @@ pub fn run_world_builder(versions: &[ModVersion], proton: &ProtonSettings) -> Re
 ///
 /// On Windows this is a direct spawn. Elsewhere the game is a Windows binary,
 /// so it is handed to Proton; anything else (a future native build) runs as is.
-fn spawn_exe(exe_name: &str, args: &[String], settings: &ProtonSettings) -> Result<std::process::Child> {
+fn spawn_exe(
+    exe_name: &str,
+    args: &[String],
+    env: &[(String, String)],
+    settings: &ProtonSettings,
+) -> Result<std::process::Child> {
     let root = config::game_dir();
     let exe_path = config::game_path(exe_name);
+    let env = env.iter().map(|(k, v)| (k, v));
 
     if cfg!(windows) || gfs::extension_of(&exe_path) != "exe" {
-        return Ok(Command::new(&exe_path).args(args).current_dir(root).spawn()?);
+        return Ok(Command::new(&exe_path).args(args).envs(env).current_dir(root).spawn()?);
     }
 
     let runner = proton::Proton::resolve(settings)?;
@@ -364,7 +382,7 @@ fn spawn_exe(exe_name: &str, args: &[String], settings: &ProtonSettings) -> Resu
         runner.name(),
         runner.prefix().display()
     );
-    Ok(runner.command(&exe_path, root, desktop).args(args).spawn()?)
+    Ok(runner.command(&exe_path, root, desktop).args(args).envs(env).spawn()?)
 }
 
 /// The Wine virtual desktop to run in, if enabled: the game's own resolution
@@ -621,6 +639,111 @@ mod tests {
             config::user_data_dir(Game::ZeroHour),
             launcher_data.join("prefix/pfx/drive_c/users/steamuser/Documents/Command and Conquer Generals Zero Hour Data")
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A game engine package, as *Zero Hour Reimagined* ships: an engine in
+    /// `x64/` with its DLLs, a loose texture, and launch scripts. Installed,
+    /// linked and started like a launch does: every file linked in, the
+    /// engine's own DLLs preferred, and the engine started from the game
+    /// folder with what its script set.
+    ///
+    /// It claims the process-wide game folder, so it must run on its own:
+    /// `cargo test game::launcher::tests::engine_package_launch_end_to_end -- --ignored --exact`.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "claims the process-wide game folder; run on its own with --ignored"]
+    fn engine_package_launch_end_to_end() {
+        use crate::game::engine_package;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("gl-e2e-engine-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let game = root.join("Zero Hour");
+        fs::create_dir_all(&game).unwrap();
+        config::set_game_dir(game.clone());
+        assert_eq!(config::game_dir(), game, "another test claimed the game folder first");
+        fs::write(game.join("generals.exe"), "").unwrap();
+        fs::write(game.join("WindowZH.big"), "BIGF").unwrap();
+        // The skirmish AI, which the game ships as a loose file.
+        fs::create_dir_all(game.join("Data/Scripts")).unwrap();
+        fs::write(game.join("Data/Scripts/SkirmishScripts.scb"), "stock ai").unwrap();
+
+        let package_dir = game.join("GLM/Reimagined/1.0.0");
+        fs::create_dir_all(package_dir.join("x64")).unwrap();
+        fs::create_dir_all(package_dir.join("Art/Textures")).unwrap();
+        let mut engine = vec![0u8; 1_200_000];
+        engine.extend_from_slice(b"CommandButton ObjectCreationList PlayerTemplate");
+        fs::write(package_dir.join("x64/generalszh64.exe"), engine).unwrap();
+        fs::write(package_dir.join("x64/d3d8.dll"), "dxvk").unwrap();
+        fs::write(package_dir.join("Art/Textures/ModIntroLogo.tga"), "tga").unwrap();
+        fs::write(
+            package_dir.join("Play-Original.bat"),
+            "@echo off\r\ncd /d \"%~dp0\"\r\nset GENERALS_GFX=d3d8\r\n\"%~dp0x64\\generalszh64.exe\" -useCwd %*\r\n",
+        )
+        .unwrap();
+        let package = engine_package::mark(&package_dir, &[game.join("generals.exe")]).unwrap().expect("a package");
+
+        let log = root.join("proton.log");
+        let fake_proton = root.join("Proton Test");
+        fs::create_dir_all(&fake_proton).unwrap();
+        fs::write(
+            fake_proton.join("proton"),
+            format!(
+                "#!/bin/bash\n\
+                 {{ echo \"argv: $*\"; echo \"cwd: $(pwd)\"; echo \"GENERALS_GFX=$GENERALS_GFX\";\n\
+                    echo \"WINEDLLOVERRIDES=$WINEDLLOVERRIDES\"; echo \"ai: $(cat Data/Scripts/SkirmishScripts.scb)\";\n\
+                    find . -type l | sort; }} > '{}'\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(fake_proton.join("proton"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        let version = ModVersion {
+            info: crate::model::ReposVersion {
+                name: "Reimagined".into(),
+                version: "1.0.0".into(),
+                modification_type: ModificationType::Mod,
+                ..Default::default()
+            },
+            is_selected: true,
+            installed: true,
+            ..Default::default()
+        };
+        let session = crate::tasks::session_info(Game::ZeroHour, false);
+        // As the app asks for an engine package: the game's own data.
+        prepare_game_files(std::slice::from_ref(&version), &session, 0, false, false, false);
+
+        let profile = package.profile();
+        let start = EngineStart { exe: package.executable.clone(), args: profile.args.clone(), env: profile.env.clone() };
+        let settings = ProtonSettings {
+            proton: fake_proton.display().to_string(),
+            virtual_desktop: false,
+            ..Default::default()
+        };
+        run_game(std::slice::from_ref(&version), true, false, "", Some(&start), &settings).unwrap();
+
+        let logged = fs::read_to_string(&log).unwrap();
+        let expect = |needle: &str| assert!(logged.contains(needle), "proton log lacks {needle:?}:\n{logged}");
+        expect(&format!("argv: waitforexitandrun {} -useCwd -win", game.join("x64/generalszh64.exe").display()));
+        expect(&format!("cwd: {}", game.display()));
+        expect("GENERALS_GFX=d3d8");
+        // The game's skirmish AI was there for it.
+        expect("ai: stock ai");
+        // The engine's own DXVK, not Wine's.
+        expect("WINEDLLOVERRIDES=d3d8=n,b");
+        // Its executable and DLL were linked in with everything else, the
+        // record of the package was not.
+        expect("./x64/generalszh64.exe");
+        expect("./x64/d3d8.dll");
+        expect("./Art/Textures/ModIntroLogo.tga");
+        assert!(!logged.contains(engine_package::MANIFEST), "{logged}");
+
+        restore_game_folder();
+        assert!(!game.join("x64/generalszh64.exe").exists());
+        assert!(!game.join("Art/Textures/ModIntroLogo.tga").exists());
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -64,8 +64,11 @@ pub fn create_mirrors_from_folder(
             continue;
         }
 
-        // A .GOF is our own backup of a patched archive, never a mod file.
-        if source.to_string_lossy().contains(config::ORIGINAL_FILE_SUFFIX) {
+        // A .GOF is our own backup of a patched archive, never a mod file;
+        // nor is the record of an engine package.
+        if source.to_string_lossy().contains(config::ORIGINAL_FILE_SUFFIX)
+            || entry.file_name() == crate::game::engine_package::MANIFEST
+        {
             continue;
         }
 

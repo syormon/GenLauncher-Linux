@@ -101,6 +101,27 @@ pub fn file_name_of(path: &Path) -> String {
     path.file_name().and_then(|e| e.to_str()).unwrap_or("").to_owned()
 }
 
+/// The files directly in `dir`, sorted.
+pub fn list_files(dir: &Path) -> Vec<PathBuf> {
+    list(dir, |t| t.is_file())
+}
+
+/// The folders directly in `dir`, sorted.
+pub fn list_dirs(dir: &Path) -> Vec<PathBuf> {
+    list(dir, |t| t.is_dir())
+}
+
+fn list(dir: &Path, keep: impl Fn(&fs::FileType) -> bool) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| keep(&t)))
+        .map(|e| e.path())
+        .collect();
+    found.sort();
+    found
+}
+
 /// True when the directory holds at least one file, at any depth.
 pub fn folder_contains_files(dir: &Path) -> bool {
     let Ok(entries) = fs::read_dir(dir) else { return false };

@@ -6,6 +6,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 
 use crate::config::{self, Game, SessionInfo};
 use crate::game::custom_engine::{self, CustomEngine};
+use crate::game::engine_package::EnginePackage;
 use crate::game::options::GameOptions;
 use crate::game::gentool;
 use crate::i18n;
@@ -176,6 +177,9 @@ pub struct GenLauncherApp {
     /// What each mod version's folder holds by way of its own game engine,
     /// worked out at most once per run: it means reading all of a mod's INI.
     engine_cache: HashMap<std::path::PathBuf, Option<CustomEngine>>,
+    /// Version folders that are, or are not, game engine packages. Cards ask
+    /// every frame, so the answer is read from disk once.
+    engine_packages: std::cell::RefCell<HashMap<std::path::PathBuf, Option<EnginePackage>>>,
 
     /// Mod whose support button should pulse after a good session.
     pub thank_you_for: Option<ModKey>,
@@ -243,6 +247,7 @@ impl GenLauncherApp {
             add_mod: None,
             manual_add: None,
             engine_cache: HashMap::new(),
+            engine_packages: Default::default(),
             thank_you_for: None,
             quit_requested: false,
         }
@@ -344,6 +349,14 @@ impl GenLauncherApp {
         // The title already says the mod was added; the body only adds what
         // is new: anything left out, and the question.
         let mut message = String::new();
+        if let Some(package) = &report.engine {
+            let profiles: Vec<&str> = package.profiles.iter().map(|p| p.name.as_str()).collect();
+            message.push_str(&i18n::trf(
+                "EnginePackageDetected",
+                &[&package.executable, &package.profile().name, &profiles.join(", ")],
+            ));
+            message.push_str("\n\n");
+        }
         if report.skipped_files > 0 {
             message.push_str(&i18n::trf(
                 "ArchiveSkipped",
@@ -478,6 +491,10 @@ impl GenLauncherApp {
             Bg::ManualAddDone { error, archives, report, banner } => {
                 self.busy = false;
                 self.add_progress = None;
+                // What was installed may have become, or stopped being, an
+                // engine package.
+                self.engine_packages.borrow_mut().clear();
+                self.engine_cache.clear();
                 // Replacing the artwork of a version added before.
                 if let Some(banner) = banner {
                     self.images.invalidate(&banner);
@@ -1064,10 +1081,16 @@ impl GenLauncherApp {
             return;
         }
 
+        // A game engine package is played instead of a mod, on its own engine.
+        let engine_package = if world_builder || vanilla { None } else { self.selected_engine_package() };
         // A mod's own engine takes the place of the launcher's modded one.
-        let custom_engine =
-            if world_builder || vanilla { None } else { self.custom_engine_for_launch() };
-        let modded_exe = if world_builder || custom_engine.is_some() {
+        let custom_engine = if world_builder || vanilla || engine_package.is_some() {
+            None
+        } else {
+            self.custom_engine_for_launch()
+        };
+        let has_selected_mod = replaces_game_data(has_selected_mod, engine_package.as_ref());
+        let modded_exe = if world_builder || custom_engine.is_some() || engine_package.is_some() {
             None
         } else {
             self.modded_exe_for(&versions)
@@ -1097,6 +1120,7 @@ impl GenLauncherApp {
                 gentool_auto_update: gentool,
                 modded_exe,
                 custom_engine,
+                engine_package,
                 vulkan: self.store.repos.vulkan.clone(),
                 proton: self.store.data.proton.clone(),
             },
@@ -1109,7 +1133,7 @@ impl GenLauncherApp {
     /// The engines the launcher would otherwise run: the game's own files and
     /// the repository's modded executable. A mod's engine is "custom" only if
     /// it differs from all of these.
-    fn known_engines(&self) -> Vec<std::path::PathBuf> {
+    pub fn known_engines(&self) -> Vec<std::path::PathBuf> {
         let mut known = vec![config::game_path("generals.exe"), config::game_path("game.dat")];
         known.extend(
             self.store
@@ -1154,7 +1178,8 @@ impl GenLauncherApp {
     /// own engine and the user has not said which one to use.
     fn engine_question(&mut self) -> Option<Dialog> {
         let version = self.store.selected_mod_version()?.clone();
-        if !version.engine.is_ask() || self.game_executable_replaced() {
+        // An engine package has one engine, so there is nothing to ask.
+        if !version.engine.is_ask() || self.game_executable_replaced() || self.engine_package(&version).is_some() {
             return None;
         }
         let engine = self.detected_engine(&version)?;
@@ -1189,6 +1214,42 @@ impl GenLauncherApp {
                 i18n::tr("EngineUseOwn"),
             )
         })
+    }
+
+    /// The engine package installed as `version`, if it is one. Read from its
+    /// folder once, then remembered.
+    pub fn engine_package(&self, version: &ModVersion) -> Option<EnginePackage> {
+        let folder = version.folder_path();
+        self.engine_packages
+            .borrow_mut()
+            .entry(folder)
+            .or_insert_with_key(|folder| EnginePackage::read(folder))
+            .clone()
+    }
+
+    fn selected_engine_package(&self) -> Option<EnginePackage> {
+        self.engine_package(self.store.selected_mod_version()?)
+    }
+
+    /// Start an engine package with another of its launch profiles from now on.
+    pub fn set_engine_profile(&mut self, name: &str, profile: usize) {
+        let Some(version) = self
+            .store
+            .modification(ModificationType::Mod, name)
+            .and_then(|m| m.versions.iter().find(|v| v.is_selected))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(mut package) = self.engine_package(&version) else { return };
+        if profile >= package.profiles.len() {
+            return;
+        }
+        package.selected = profile;
+        if let Err(e) = package.write(&version.folder_path()) {
+            self.show_dialog(Dialog::error(i18n::tr("Error"), format!("{e:#}")));
+        }
+        self.engine_packages.borrow_mut().remove(&version.folder_path());
     }
 
     /// The engine file to start the selected mod with, when the user chose
@@ -1401,6 +1462,15 @@ struct LaunchSet {
     gentool: bool,
 }
 
+/// Does the launch run a mod's data in place of the game's? Only then are the
+/// game's loose scripts left hidden, for the mod's own to take over. An engine
+/// package is selected like a mod but usually brings no data: it runs the
+/// game's, and without the stock `SkirmishScripts.scb` the skirmish AI does
+/// nothing.
+fn replaces_game_data(has_selected_mod: bool, engine_package: Option<&EnginePackage>) -> bool {
+    has_selected_mod && engine_package.is_none_or(|p| p.has_game_data)
+}
+
 /// What to run: everything selected, or for a vanilla launch nothing at all.
 ///
 /// Vanilla is the game as it shipped plus GenTool, which is there for the
@@ -1468,7 +1538,7 @@ fn screen_pixels(points: egui::Vec2, pixels_per_point: f32) -> Option<(u32, u32)
 
 #[cfg(test)]
 mod tests {
-    use super::{launch_set, reorder, screen_pixels};
+    use super::{launch_set, reorder, replaces_game_data, screen_pixels, EnginePackage};
 
     #[test]
     fn the_monitor_size_is_measured_in_pixels() {
@@ -1524,6 +1594,22 @@ mod tests {
 
         store.data.auto_update_gentool = true;
         assert!(launch_set(&store, false).gentool);
+    }
+
+    #[test]
+    fn an_engine_package_runs_on_the_games_own_data() {
+        let mut package = EnginePackage {
+            executable: "x64/generalszh64.exe".into(),
+            profiles: vec![Default::default()],
+            selected: 0,
+            has_game_data: false,
+        };
+        assert!(replaces_game_data(true, None));
+        assert!(!replaces_game_data(true, Some(&package)));
+        assert!(!replaces_game_data(false, None));
+        // One that brings its own data runs on it, as a mod does.
+        package.has_game_data = true;
+        assert!(replaces_game_data(true, Some(&package)));
     }
 
     #[test]

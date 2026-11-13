@@ -109,10 +109,12 @@ fn extract_zip(archive: &Path, dest: &Path, progress: &dyn Fn(Option<f32>)) -> R
 
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
-        // `enclosed_name` rejects `..` and absolute paths (zip-slip).
-        let Some(rel) = entry.enclosed_name() else { continue };
+        let Some(rel) = zip_entry_path(entry.name()) else {
+            log::warn!("skipping {:?} in {}: it would unpack outside the folder", entry.name(), archive.display());
+            continue;
+        };
         let out = dest.join(rel);
-        if entry.is_dir() {
+        if entry.is_dir() || entry.name().ends_with(['/', '\\']) {
             fs::create_dir_all(&out)?;
             continue;
         }
@@ -128,6 +130,26 @@ fn extract_zip(archive: &Path, dest: &Path, progress: &dyn Fn(Option<f32>)) -> R
         std::io::copy(&mut counting, &mut writer)?;
     }
     Ok(())
+}
+
+/// Where the zip entry `name` unpacks to, relative to the destination.
+///
+/// Zips made on Windows often separate folders with `\`, which the zip
+/// library only splits on under Windows; elsewhere `Zero Hour\x64\game.exe`
+/// would land as one file of that name. Either slash separates here. `None`
+/// for a name that would climb out of the destination (zip-slip) or name a
+/// drive, and for one that names nothing.
+fn zip_entry_path(name: &str) -> Option<PathBuf> {
+    let mut rel = PathBuf::new();
+    for part in name.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            part if part.contains(':') => return None,
+            part => rel.push(part),
+        }
+    }
+    (!rel.as_os_str().is_empty()).then_some(rel)
 }
 
 fn extract_7z(archive: &Path, dest: &Path, progress: &dyn Fn(Option<f32>)) -> Result<()> {
@@ -567,6 +589,40 @@ mod tests {
             \x08\x08\x08\x08 40%\x08\x08\x08\x08 99%\x08\x08\x08\x08\x08  OK \nAll OK\n";
         assert_eq!(percentages(RarToolKind::Unrar, output, 1), [5, 40, 99]);
         assert_eq!(percentages(RarToolKind::Unrar, output, 3), [5, 40, 99]);
+    }
+
+    #[test]
+    fn a_zip_made_with_backslashes_unpacks_into_folders() {
+        use std::io::Write;
+        let dir = scratch("backslash");
+        let archive = dir.join("engine.zip");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.add_directory("Zero Hour\\Art\\", options).unwrap();
+        zip.start_file("Zero Hour\\x64\\engine.exe", options).unwrap();
+        zip.write_all(b"engine").unwrap();
+        zip.start_file("..\\escape.txt", options).unwrap();
+        zip.write_all(b"no").unwrap();
+        zip.finish().unwrap();
+
+        let out = dir.join("out");
+        extract_with_progress(&archive, &out, false, &|_| {}).unwrap();
+        assert_eq!(fs::read(out.join("Zero Hour/x64/engine.exe")).unwrap(), b"engine");
+        assert!(out.join("Zero Hour/Art").is_dir());
+        assert!(!dir.join("escape.txt").exists() && !out.join("escape.txt").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_zip_entry_never_unpacks_outside_the_folder() {
+        assert_eq!(zip_entry_path("a/b\\c.big"), Some(PathBuf::from("a").join("b").join("c.big")));
+        assert_eq!(zip_entry_path("./Data/x.ini"), Some(PathBuf::from("Data").join("x.ini")));
+        assert_eq!(zip_entry_path("/etc/passwd"), Some(PathBuf::from("etc").join("passwd")));
+        assert_eq!(zip_entry_path("a/../../b"), None);
+        assert_eq!(zip_entry_path("..\\b"), None);
+        assert_eq!(zip_entry_path("C:\\Windows\\x.dll"), None);
+        assert_eq!(zip_entry_path("a/"), Some(PathBuf::from("a")));
+        assert_eq!(zip_entry_path("/"), None);
     }
 
     #[test]

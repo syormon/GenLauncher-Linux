@@ -11,7 +11,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::config::{self, Game};
-use crate::game::{launcher, stock_files};
+use crate::game::{engine_package, launcher, stock_files};
 use crate::util::archive;
 use crate::util::fs as gfs;
 
@@ -26,6 +26,8 @@ pub struct InstallReport {
     pub skipped_bytes: u64,
     /// The best picture the mod came with, for its card.
     pub artwork: Option<Artwork>,
+    /// Set when what was installed is a game engine package.
+    pub engine: Option<engine_package::EnginePackage>,
 }
 
 impl InstallReport {
@@ -130,7 +132,7 @@ pub fn install(
         let root = find_game_root(&staging, game);
         if !contains_game_root(&root, 0) {
             bail!(
-                "{} has no .big files or Data folder, so there is nothing to install. \
+                "{} has no .big files, Data folder or game engine, so there is nothing to install. \
                  If it holds an installer, run that yourself.",
                 gfs::file_name_of(archive_path)
             );
@@ -399,6 +401,8 @@ fn is_archive_name(path: &Path) -> bool {
 fn is_game_root(dir: &Path) -> bool {
     files_in(dir).iter().any(|f| is_archive_name(f))
         || subdirs(dir).iter().any(|d| gfs::file_name_of(d).eq_ignore_ascii_case("data"))
+        // A game engine package has neither, only the engine and its files.
+        || engine_package::find_engine(dir, &[]).is_some()
 }
 
 fn contains_game_root(dir: &Path, depth: usize) -> bool {

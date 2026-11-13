@@ -36,6 +36,7 @@ A Steam installation in its Steam library keeps Steam's own prefix, so saves and
 * `.rar` extraction uses 7-Zip, `unrar` or `unar` if one is installed (on PATH, or in 7-Zip's or WinRAR's default folder on Windows). `.zip` and `.7z` need nothing.
 * **Add mod from files understands downloaded archives.** Pick the `.zip`/`.rar`/`.7z` as downloaded (e.g. from ModDB): the name and version are suggested from the file name, wrapper folders are stepped through, a full-game repack is reduced to the files the mod actually changes, and you are asked afterwards whether to delete the archive. A `banner.png`/`.jpg` shipped with the mod (or picked alongside its files) becomes the mod's card artwork, or failing that a `.bmp` it ships (such as its `Install_Final.bmp` splash), shown whole rather than stretched; and mods added this way are marked "(user added mod)" beside their version.
 * **Mods with their own game engine.** A mod's `.exe`/`.dll` files are never linked into the game. If a mod ships a *modified game engine* (and so crashes with "Technical Difficulties" on the normal one), the launcher detects it at launch and asks whether to run the mod's engine, the standard one, or not launch. The answer is kept per mod; right-click the mod's card to change it.
+* **Game engines.** Some mods come with their own custom game engine; sometimes with no `.big` archives, and `.bat` scripts to start it (*Zero Hour Reimagined*). Added from files as a mod, its card is tagged **GAME ENGINE**. Scripts are read, never run: only their `set NAME=value` lines and the line that starts the engine are used, and they are left out of the install. When the scripts start one of several engines, that one is used. A package with several scripts (e.g. *Updated* and *Original*) starts with the plainest, the one with the fewest settings and arguments; right-click the card, **Start with**, to switch. A package that brings no game data runs on the game's own, stock AI scripts included; one that also brings `.big` archives or a `Data` folder runs on those, as a mod does. An archive with a package per game (`Zero Hour/`, `Generals/`) installs the one for the game in use. GenTool does not hook a 64-bit engine.
 * **Launch vanilla.** A second launch button starts the game with no mods, patches or add-ons, whatever is selected, and leaves the selection alone. GenTool is still used, even when its option is off.
 * No self-update
 * No advertising card
@@ -86,6 +87,13 @@ A second does the same for a copy of the game outside Steam, on the launcher's o
 ```bash
 cargo test game::launcher::tests::managed_proton_launch_end_to_end -- --ignored --exact
 cargo test live_listings_parse -- --ignored
+```
+
+A third starts a stand-in game engine package in place of the game's engine (CI runs it too), and on any platform a real package archive can be installed and linked into a scratch game folder:
+
+```bash
+cargo test game::launcher::tests::engine_package_launch_end_to_end -- --ignored --exact
+GL_ENGINE_PACKAGE=/path/to/ZeroHourReimagined_1.0.0.zip cargo test tasks::tests::installs_a_real_engine_package -- --ignored --exact
 ```
 
 ## General Network usage:

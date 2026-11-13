@@ -113,6 +113,12 @@ fn find_with_contents(mod_folder: &Path, known_engines: &[PathBuf]) -> Option<(S
     })
 }
 
+/// Is the file at `path` a game engine (not World Builder) that differs from
+/// every one of `known_engines`?
+pub fn is_new_engine(path: &Path, known_engines: &[PathBuf]) -> bool {
+    read_engine(path).is_some_and(|bytes| !known_engines.iter().any(|known| same_file_contents(known, &bytes)))
+}
+
 /// The file's contents, if it is a game engine.
 fn read_engine(path: &Path) -> Option<Vec<u8>> {
     let size = std::fs::metadata(path).ok()?.len();

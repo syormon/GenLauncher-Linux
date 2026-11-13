@@ -545,6 +545,9 @@ pub struct LaunchRequest {
     /// The selected mod's own game engine (a file in its folder), when the
     /// user chose to run it instead of the standard one.
     pub custom_engine: Option<String>,
+    /// The game engine package selected in place of a mod, to start instead
+    /// of the game's engine.
+    pub engine_package: Option<game::engine_package::EnginePackage>,
     /// Set when the repository advertises a Vulkan layer, so the launch can
     /// refresh it before starting the game.
     pub vulkan: Option<VulkanData>,
@@ -593,6 +596,7 @@ fn run_launch(request: LaunchRequest, tx: Sender<Bg>) {
         gentool_auto_update,
         modded_exe,
         custom_engine,
+        engine_package,
         vulkan,
         proton,
     } = request;
@@ -658,7 +662,7 @@ fn run_launch(request: LaunchRequest, tx: Sender<Bg>) {
             .ok_or_else(|| anyhow::anyhow!("no mod is selected"))
             .and_then(|mod_version| launcher::link_custom_engine(mod_version, &file));
         match linked {
-            Ok(exe) => engine_exe = Some(exe),
+            Ok(exe) => engine_exe = Some(launcher::EngineStart { exe, ..Default::default() }),
             Err(e) => {
                 launcher::restore_game_folder();
                 let _ = tx.send(Bg::GameFinished {
@@ -669,6 +673,25 @@ fn run_launch(request: LaunchRequest, tx: Sender<Bg>) {
                 return;
             }
         }
+    }
+
+    // An engine package was linked in with the rest of its files above.
+    if let Some(package) = engine_package.filter(|_| !world_builder) {
+        if !config::game_path(&package.executable).is_file() {
+            launcher::restore_game_folder();
+            let _ = tx.send(Bg::GameFinished {
+                world_builder,
+                played_long_enough: false,
+                error: Some(format!("{} is no longer in the engine's folder", package.executable)),
+            });
+            return;
+        }
+        let profile = package.profile();
+        engine_exe = Some(launcher::EngineStart {
+            exe: package.executable.clone(),
+            args: profile.args.clone(),
+            env: profile.env.clone(),
+        });
     }
 
     let _ = tx.send(Bg::GamePrepared { world_builder, ok: true });
@@ -694,7 +717,7 @@ fn run_launch(request: LaunchRequest, tx: Sender<Bg>) {
     let result = if world_builder {
         launcher::run_world_builder(&versions, &proton).map(|()| false)
     } else {
-        launcher::run_game(&versions, windowed, quick_start, &game_params, engine_exe.as_deref(), &proton)
+        launcher::run_game(&versions, windowed, quick_start, &game_params, engine_exe.as_ref(), &proton)
             .map(|o| o.played_long_enough)
     };
 
@@ -890,6 +913,7 @@ pub fn spawn_manual_add(
     files: Vec<PathBuf>,
     target_relative: String,
     banner_target: Option<PathBuf>,
+    known_engines: Option<Vec<PathBuf>>,
     game: Game,
     tx: Sender<Bg>,
 ) {
@@ -908,7 +932,9 @@ pub fn spawn_manual_add(
             }
         };
 
-        let message = match install_files(&files, &target, game, banner_target.as_deref(), &progress) {
+        let installed =
+            install_files(&files, &target, game, banner_target.as_deref(), known_engines.as_deref(), &progress);
+        let message = match installed {
             Ok(report) => Bg::ManualAddDone {
                 error: None,
                 archives: files
@@ -937,11 +963,15 @@ pub fn spawn_manual_add(
 /// installed with the mod. Without a banner, the first bitmap found is used
 /// instead, and is installed as well. Without either, nothing is saved and
 /// the card keeps the stock picture.
+///
+/// With `known_engines`, what was installed is checked for being a game engine
+/// package (see [`game::engine_package`]): an engine other than those.
 fn install_files(
     files: &[PathBuf],
     target: &std::path::Path,
     game: Game,
     banner_target: Option<&std::path::Path>,
+    known_engines: Option<&[PathBuf]>,
     progress: &dyn Fn(String, Option<f32>),
 ) -> anyhow::Result<InstallReport> {
     use game::mod_archive::{Artwork, ArtworkKind, Stage};
@@ -1001,6 +1031,10 @@ fn install_files(
             report.artwork = None;
         }
     }
+
+    if let Some(known) = known_engines {
+        report.engine = game::engine_package::mark(target, known)?;
+    }
     Ok(report)
 }
 
@@ -1022,7 +1056,7 @@ mod tests {
         let target = dir.join("GLM/My Mod/1.0");
         let artwork = dir.join("LauncherImages/My Mod/1.0");
         let files = vec![picked.join("Banner.png"), picked.join("!Mod.big"), picked.join("banner.jpg")];
-        let report = install_files(&files, &target, Game::ZeroHour, Some(&artwork), &|_, _| {}).unwrap();
+        let report = install_files(&files, &target, Game::ZeroHour, Some(&artwork), None, &|_, _| {}).unwrap();
 
         assert!(report.has_banner());
         // The first banner picked wins; the second is installed like any file.
@@ -1035,7 +1069,7 @@ mod tests {
 
         // Without a place for artwork (a patch or addon), it is just a file.
         let addon = dir.join("GLM/My Mod/Addons/HUD/1.0");
-        let report = install_files(&files[..1], &addon, Game::ZeroHour, None, &|_, _| {}).unwrap();
+        let report = install_files(&files[..1], &addon, Game::ZeroHour, None, None, &|_, _| {}).unwrap();
         assert!(report.artwork.is_none());
         assert!(addon.join("Banner.png").exists());
         let _ = fs::remove_dir_all(&dir);
@@ -1056,7 +1090,7 @@ mod tests {
         // A bitmap alone is used, and still installed: it may be a game file.
         let target = dir.join("GLM/A/1.0");
         let artwork = dir.join("LauncherImages/A/1.0");
-        install_files(&[bitmap.clone(), picked.join("!Mod.big")], &target, Game::ZeroHour, Some(&artwork), &|_, _| {})
+        install_files(&[bitmap.clone(), picked.join("!Mod.big")], &target, Game::ZeroHour, Some(&artwork), None, &|_, _| {})
             .unwrap();
         assert_eq!(fs::read(&artwork).unwrap(), fs::read(&bitmap).unwrap());
         assert!(target.join("Install_Final.bmp").exists());
@@ -1064,7 +1098,7 @@ mod tests {
         // A banner picked after it still wins.
         let target = dir.join("GLM/B/1.0");
         let artwork = dir.join("LauncherImages/B/1.0");
-        install_files(&[bitmap.clone(), banner.clone()], &target, Game::ZeroHour, Some(&artwork), &|_, _| {})
+        install_files(&[bitmap.clone(), banner.clone()], &target, Game::ZeroHour, Some(&artwork), None, &|_, _| {})
             .unwrap();
         assert_eq!(fs::read(&artwork).unwrap(), fs::read(&banner).unwrap());
 
@@ -1072,9 +1106,71 @@ mod tests {
         let target = dir.join("GLM/C/1.0");
         let artwork = dir.join("LauncherImages/C/1.0");
         let report =
-            install_files(&[picked.join("!Mod.big")], &target, Game::ZeroHour, Some(&artwork), &|_, _| {}).unwrap();
+            install_files(&[picked.join("!Mod.big")], &target, Game::ZeroHour, Some(&artwork), None, &|_, _| {}).unwrap();
         assert!(report.artwork.is_none());
         assert!(!artwork.exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A real game engine package, added from its archive as the launcher
+    /// does, into a scratch game folder, then linked in for a launch. Give
+    /// the archive in `GL_ENGINE_PACKAGE` (e.g. `ZeroHourReimagined_1.0.0.zip`,
+    /// which holds one package per game) and run on its own:
+    /// `cargo test tasks::tests::installs_a_real_engine_package -- --ignored --exact`.
+    #[test]
+    #[ignore = "needs an engine package archive in GL_ENGINE_PACKAGE, and claims the game folder"]
+    fn installs_a_real_engine_package() {
+        let Some(archive) = std::env::var_os("GL_ENGINE_PACKAGE").map(PathBuf::from) else {
+            eprintln!("GL_ENGINE_PACKAGE is not set; nothing to test");
+            return;
+        };
+        let root = std::env::temp_dir().join(format!("gl-real-engine-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let game = root.join("Zero Hour");
+        fs::create_dir_all(&game).unwrap();
+        config::set_game_dir(game.clone());
+        assert_eq!(config::game_dir(), game, "another test claimed the game folder first");
+        for name in ["generals.exe", "game.dat"] {
+            fs::write(game.join(name), "stock").unwrap();
+        }
+        fs::write(game.join("INIZH.big"), "BIGF").unwrap();
+        let known = vec![game.join("generals.exe"), game.join("game.dat")];
+
+        for (mode, engine) in [(Game::ZeroHour, "x64/generalszh64.exe"), (Game::Generals, "x64/generalsv64.exe")] {
+            let target = game.join(format!("GLM/Reimagined {mode:?}/1.0.0"));
+            let report = install_files(std::slice::from_ref(&archive), &target, mode, None, Some(&known), &|_, _| {}).unwrap();
+            let package = report.engine.expect("an engine package");
+            eprintln!("{mode:?}: {package:#?}");
+            assert_eq!(package.executable, engine);
+            assert_eq!(package.profile().args, ["-useCwd"]);
+            assert!(package.profile().env.is_empty(), "the plain start is the default");
+            let original = package.profiles.iter().find(|p| p.name == "Original").expect("Play-Original");
+            assert!(original.env.contains(&("GENERALS_ORIGINAL".to_owned(), "1".to_owned())));
+            // The engine's DLLs and textures are in, the scripts are not.
+            assert!(target.join("x64/d3d8.dll").is_file());
+            assert!(target.join("Art/Textures/ModIntroLogo.tga").is_file());
+            assert!(!target.join("Play-Updated.bat").exists());
+        }
+
+        let version = ModVersion {
+            info: ReposVersion {
+                name: "Reimagined ZeroHour".into(),
+                version: "1.0.0".into(),
+                modification_type: ModificationType::Mod,
+                ..Default::default()
+            },
+            is_selected: true,
+            installed: true,
+            ..Default::default()
+        };
+        launcher::prepare_game_files(std::slice::from_ref(&version), &session_info(Game::ZeroHour, false), 0, true, false, false);
+        for linked in ["x64/generalszh64.exe", "x64/avcodec-62.dll", "Art/Textures/exscorch01.dds"] {
+            assert!(gfs::is_symlink(&game.join(linked)), "{linked} is not linked in");
+        }
+        assert!(!game.join(game::engine_package::MANIFEST).exists());
+
+        launcher::restore_game_folder();
+        assert!(!game.join("x64/generalszh64.exe").exists());
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -272,6 +272,7 @@ fn mods_list(app: &mut GenLauncherApp, ui: &mut egui::Ui) {
             enabled: !app.busy,
             thank_you: app.thank_you_for.as_ref() == Some(&key),
             engine: app.engine_menu_state(&modification),
+            engine_package: modification.display_version().and_then(|v| app.engine_package(v)),
         };
 
         let outcome = mod_row::mod_row(ui, &mut app.images, &modification, context);
@@ -364,6 +365,7 @@ fn dependent_list(app: &mut GenLauncherApp, ui: &mut egui::Ui, kind: Modificatio
             enabled: !app.busy,
             thank_you: false,
             engine: None,
+            engine_package: None,
         };
 
         let outcome = mod_row::addon_row(ui, modification, context);
@@ -457,6 +459,7 @@ fn apply_action(
         RowAction::OpenUrl(url) => util::open_external(&url),
 
         RowAction::SetEngine(choice) => app.set_engine_choice(name, choice),
+        RowAction::SetEngineProfile(profile) => app.set_engine_profile(name, profile),
 
         RowAction::OpenModFolder => open_mod_folder(app, kind, name),
 

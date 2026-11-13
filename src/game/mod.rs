@@ -1,5 +1,6 @@
 pub mod big;
 pub mod custom_engine;
+pub mod engine_package;
 pub mod gentool;
 pub mod launcher;
 pub mod managed_proton;

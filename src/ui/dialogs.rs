@@ -264,11 +264,14 @@ pub fn show_manual_add(app: &mut GenLauncherApp, ctx: &Context) {
         // Only a mod's card shows artwork, so only a mod takes a banner.
         let banner = (state.kind == ModificationType::Mod)
             .then(|| config::mod_image_path(&state.name, &state.version));
+        // A game engine package is played on its own, as a mod is.
+        let known_engines = (state.kind == ModificationType::Mod).then(|| app.known_engines());
         tasks::spawn_manual_add(
             app.runtime(),
             state.files.clone(),
             state.target_relative(),
             banner,
+            known_engines,
             app.session.game_mode,
             app.tx.clone(),
         );
